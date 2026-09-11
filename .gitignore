@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+logs/
+sn_results/
+debug/
+*.log
+sophon-demo/
+*.bmodel

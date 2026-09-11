@@ -1,0 +1,22 @@
+[Unit]
+Description=SN Monitor (RTSP -> PP-OCR) v9 persistent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Environment=PYTHONUNBUFFERED=1
+WorkingDirectory=/data/soph_SN
+# --idle 0: 永不因空闲退出; 源未起时 reconnect() 轻量探活等待, 不狂刷 ffmpeg
+ExecStart=/usr/bin/python3 /data/soph_SN/sn_monitor.py --rtsp rtsp://192.168.1.9:8554/live0 --idle 0 --mi 5
+Restart=always
+RestartSec=5
+# stop 时发 SIGINT -> v9 干净退出(release 发 TEARDOWN)
+KillSignal=SIGINT
+TimeoutStopSec=15
+StandardOutput=append:/data/soph_SN/logs/sn_monitor.service.log
+StandardError=append:/data/soph_SN/logs/sn_monitor.service.log
+
+[Install]
+WantedBy=multi-user.target
