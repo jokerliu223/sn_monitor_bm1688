@@ -1,0 +1,12 @@
+[Unit]
+Description=SN capture uploader (SE9 -> product_test)
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /data/soph_SN/tools/sn_uploader.py --url http://10.80.40.57:8099/api/v1/captures
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

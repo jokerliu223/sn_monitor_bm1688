@@ -1,6 +1,6 @@
 # SN 监控系统 (RTSP → PP-OCR 序列号识别)
 
-SE9 / BM1688 算能板通过 eth1 直连工业摄像头，实时拉 RTSP 流，自动侦测板卡铭牌、识别序列号(SN)并落库。当前稳定版本 **v18**。
+SE9 / BM1688 算能板通过 eth1 直连工业摄像头，实时拉 RTSP 流，自动侦测板卡铭牌、识别序列号(SN)并落库。当前发布版本 **V2.0.2**（本仓库为可直接 git 部署的发布版；版本演进见第 7 节）。
 
 ---
 
@@ -31,37 +31,98 @@ SE9 / BM1688 算能板通过 eth1 直连工业摄像头，实时拉 RTSP 流，�
 
 ---
 
-## 3. 文件结构
+## 3. 文件结构与部署
 
-### 板子（`/data/soph_SN/`，只保留关键文件）
+### 3.1 本仓库结构（git 跟踪的内容 = 可直接部署的代码）
+```
+sn_monitor_bm1688/
+  sn_monitor.py          # ★ 唯一入口：RTSP 拉流 + 状态机 + 档位裁剪 + OCR + 投票 + 落库
+  sncore/                # SN 处理内核（被 sn_monitor.py import）
+    sn_extract.py        #   SN 提取: 多帧投票 + 格式校验 + 掉字子序列合并
+    result_gate.py       #   结果二次确认门(ResultGate)
+    sn_line.py           #   SN 行版式辅助
+    __init__.py
+  tools/                 # 辅助工具（不参与识别主链路，按需运行，见 3.4 与第 4 节）
+    sn_uploader.py       #   命中结果 sidecar：上传 SN+命中帧到 .57 产测系统（见 4.6）
+    profile_probe.py     #   参数扫描工具：新模组快速定档（见 4.7）
+  deploy/
+    sn-monitor.service   #   识别服务 systemd 单元（拷到 /etc/systemd/system/ 用）
+    sn-uploader.service  #   上传 sidecar systemd 单元（可选，见 4.6）
+  README.md              # 本文档
+  .gitignore             # 排除模型/框架/运行时产物（见 3.3：这些不进 git）
+```
+> **只有代码进 git**。模型 `*.bmodel`、官方框架 `sophon-demo/`、运行时产物 `logs/`、`sn_results/`、`debug/` 全部 `.gitignore`——它们体积大且环境相关，另按 3.3 部署。
+
+### 3.2 板子运行时目录（`/data/soph_SN/`）
+git 部署后的代码 + 3.3 装好的模型/框架，在板子上合成如下运行时布局：
 ```
 /data/soph_SN/
-  sn_monitor.py # 唯一入口（= 工作站 sn_monitor.new.py 的部署副本, root 独立文件非 symlink）
-  sncore/
-    sn_extract.py        # SN 提取: 多帧投票 + 格式校验 + 掉字子序列合并
-    result_gate.py       # 结果二次确认门(ResultGate)
-    sn_line.py           # SN 行版式辅助
-    __init__.py
-  sophon-demo/.../PP-OCR/ # 官方 PP-OCR 框架 + models/BM1688/*.bmodel + datasets 字典
-  logs/           # 服务日志 sn_monitor.service.log (StandardOutput=append, 不进 journalctl)
-  sn_results/            # 识别结果 JSON + sn_list.txt (注意目录名是 sn_results 不是 results)
-  debug/                 # 漏检/待确认留证(原帧+ROI+候选, 限 40 组)
-  sn_uploader.py       # (可选) 命中结果 sidecar 上传到 .57 product_test 系统
-/etc/systemd/system/sn-monitor.service
+  sn_monitor.py          # ← git 部署（本仓库根）
+  sncore/                # ← git 部署
+  tools/                 # ← git 部署（sn_uploader.py / profile_probe.py）
+  sophon-demo/sample/PP-OCR/   # ← 3.3 装：官方框架 + models/BM1688/*.bmodel + datasets 字典
+  logs/                  # 运行时：服务日志 sn_monitor.service.log（不进 journalctl）
+  sn_results/            # 运行时：识别结果 JSON + sn_list.txt（目录名是 sn_results 不是 results）
+  debug/                 # 运行时：漏检/待确认留证（原帧+ROI+候选，限 40 组）
+/etc/systemd/system/sn-monitor.service     # ← deploy/sn-monitor.service 拷入
 ```
 
-### 工作站（`/media/sophgo/xiaohao.liu/SN_cratch/`，主副本 + 历史）
+### 3.3 模型 / 框架部署（PP-OCR bmodel + sail，一次性）
+识别依赖官方 PP-OCR 框架与 BM1688 的 `*.bmodel`（**不在 git 里**）。首装步骤（详见 wiki《PP-OCR 搭建及测试》：
+<https://wiki.sophgo.com/pages/viewpage.action?pageId=228896451>）：
+
+```bash
+# ① 克隆 sophon-demo 并下载 PP-OCR 模型（bmodel 随 download.sh 拉取）
+cd /data/soph_SN
+git clone https://github.com/sophgo/sophon-demo.git
+cd sophon-demo/sample/PP-OCR
+chmod -R +x scripts/
+./scripts/download.sh
+
+# ② 安装依赖 + sophon-sail（板子上 OCR 推理靠 sail）
+pip3 install -r python/requirements.txt
+pip3 install opencv-python-headless
+pip3 install dfss && python3 -m dfss --install sail
+echo 'export LD_LIBRARY_PATH=/opt/sophon/sophon-sail/lib/:$LD_LIBRARY_PATH' >> ~/.bashrc
+source ~/.bashrc
+
+# ③ 验证模型已就位
+ls -la models/BM1688/          # 应见 ch_PP-OCRv4_{det,rec}_*_2core.bmodel
+
+# ④ 用官方样例图快速验证模型能跑（wiki 第 4 步）
+cd /data/soph_SN/sophon-demo/sample/PP-OCR/python
+python3 ppocr_system_opencv.py \
+    --input=../datasets/train_full_images_0 --batch_size=1 \
+    --bmodel_det=../models/BM1688/ch_PP-OCRv4_det_fp16_2core.bmodel \
+    --bmodel_rec=../models/BM1688/ch_PP-OCRv4_rec_fp16_2core.bmodel \
+    --dev_id=0 --img_size "[[640,48],[320,48]]" \
+    --char_dict_path=../datasets/ppocr_keys_v1.txt
+# ⑤ 换 --input=/data/soph_SN/sn_test 可用自己的铭牌图再验一遍
 ```
-sn_monitor.new.py    # ★ 主副本(master), 改这里再部署到板子
-sn_monitor.py     # → 指向 sn_monitor.new.py 的软链
-profile_probe.py     # 参数扫描工具(新模组快速定档, 见 4.7); scp 到板子跑
-sncore/           # 与板子同源
-sn-monitor.service       # service 单元文件
-README.md            # 本文档
-archive/
-  board_versions/        # v8~v18 全部历史版本备份
-  board_legacy/          # 早期探索脚本(sn_barcode/fast/final/inline/tile_scan…)
+> 本项目生产用 **int8 双核** `ch_PP-OCRv4_{det,rec}_int8_2core.bmodel`（比 fp16 快）；wiki 验证步骤用 fp16 只为跑通。`download.sh` 会把 int8/fp16/fp32 都拉下来。
+
+### 3.4 git 快速部署代码（更新识别脚本/工具）
+代码（`sn_monitor.py`/`sncore/`/`tools/`/`deploy/`）全部走 git，**一条命令部署或更新**：
+
+```bash
+# 首次：板子上克隆本仓库到 /data/soph_SN（模型另按 3.3 装）
+cd /data && git clone <本仓库地址> soph_SN     # 或克隆到别处再软链/拷贝
+
+# 之后更新：板子上直接拉最新代码
+cd /data/soph_SN && git pull
+python3 -m py_compile sn_monitor.py tools/*.py     # 语法自检
+sudo cp deploy/sn-monitor.service /etc/systemd/system/ && sudo systemctl daemon-reload   # service 有变更时
+sudo systemctl restart sn-monitor                  # 生效（★ 记得同时重启摄像头推流！）
 ```
+> `git pull` 不影响正在跑的进程；生效才需 `restart`。`logs/`、`sn_results/`、`sophon-demo/` 已 `.gitignore`，`git pull` 不会动它们。
+
+### 3.5 `tools/` 辅助工具一览
+两个工具都**不参与识别主链路**，随 git 部署到 `/data/soph_SN/tools/`，按需手动运行。
+
+| 工具 | 作用 | 使用方式 | 详见 |
+|------|------|----------|------|
+| `sn_uploader.py` | 命中结果 sidecar：监视 `sn_results/`，把 SN+命中帧 HTTP 上传到 .57 产测系统前端/DB。纯 urllib、`.uploaded` 防重传、与识别解耦不影响拉流 | 常驻服务 `sn-uploader`（`deploy/sn-uploader.service`）或前台手动跑 | **4.6** |
+| `profile_probe.py` | 参数扫描器：对「图片+期望SN」笛卡尔积扫裁剪/切块参数，报耗时/命中/候选并推荐档位，新模组快速定档。只读跑 OCR | 前台手动跑，`sudo python3 tools/profile_probe.py ...` | **4.7** |
 
 ---
 
@@ -96,7 +157,7 @@ sudo python3 sn_monitor.py --rtsp rtsp://192.168.1.9:8554/live0 --idle 0 --profi
 # ★ 手动跑也会杀源：本条启动后 / Ctrl-C 结束后，都要同时重启摄像头推流
 
 # 如需上传到前端/DB（可选，另开一个终端；不上传就不用起）：
-sudo python3 /data/soph_SN/sn_uploader.py --url http://10.80.40.57:8099/api/v1/captures --interval 3
+sudo python3 /data/soph_SN/tools/sn_uploader.py --url http://10.80.40.57:8099/api/v1/captures --interval 3
 ```
 > 大板/小板唯一区别就是 `--profile`（一次切换裁剪几何/上采样/确认门，见 4.3）。
 > 结果落在 `/data/soph_SN/sn_results/`（`sn_<SN>_<ts>.json` + 命中帧 `.jpg`）。
@@ -125,7 +186,7 @@ sudo python3 sn_monitor.py --rtsp rtsp://192.168.1.9:8554/live0 --idle 0 --profi
 # 同时重启摄像头推流
 ```
 
-### 4.3 档位系统（v18 核心）
+### 4.3 档位系统（V2.0.1 核心）
 
 一个 `--profile` 打包一档参数（裁剪几何 + 切片 + 抽帧 + 确认门）。显式 CLI 标志仍覆盖档位。
 
@@ -165,16 +226,7 @@ sudo python3 sn_monitor.py --rtsp rtsp://192.168.1.9:8554/live0 --idle 0 --profi
 > 稳定性兜底参数 `--wedge-*` / `--stale-*` 一般不用动。
 
 ### 4.5 更新脚本到板子
-在工作站改 `sn_monitor.new.py` 后：
-```bash
-# 工作站
-scp sn_monitor.new.py linaro@10.80.40.53:/tmp/sn_new.py
-# 板子(先备份再覆盖，注意备份留工作站、板子只留最新)
-sudo cp -a /data/soph_SN/sn_monitor.py /tmp/sn_bak && \
-sudo cp /tmp/sn_new.py /data/soph_SN/sn_monitor.py && \
-python3 -m py_compile /data/soph_SN/sn_monitor.py
-```
-> 拷贝 .py 不影响正在跑的进程；生效需重启服务(→ 记得同时重启摄像头)。
+代码走 git，见 **3.4 git 快速部署**：板子上 `git pull` → `py_compile` 自检 → `systemctl restart sn-monitor`（记得同时重启摄像头推流）。`git pull` 不影响在跑进程，生效才需 restart。
 
 ### 4.6 实时上传到前端/数据库（sn-uploader sidecar）
 
@@ -191,6 +243,10 @@ python3 -m py_compile /data/soph_SN/sn_monitor.py
 
 **是否每次都要单独启动？→ 不用。** 板子上把两个服务各 `enable --now` 一次即长期常驻：
 ```bash
+# 首次：从 deploy/ 装单元（已装过可跳过）
+sudo cp /data/soph_SN/deploy/sn-monitor.service /data/soph_SN/deploy/sn-uploader.service /etc/systemd/system/
+sudo systemctl daemon-reload
+# 启用（开机自启 + 立即启动）
 sudo systemctl enable --now sn-monitor    # 识别
 sudo systemctl enable --now sn-uploader   # 上传(sidecar 必须 root，否则 .uploaded 写不进→重复上传)
 journalctl -u sn-uploader -f           # 看上传实时日志
@@ -199,42 +255,39 @@ journalctl -u sn-uploader -f           # 看上传实时日志
 
 **只想临时手动上传**（不启用服务时，另开终端）：
 ```bash
-sudo python3 /data/soph_SN/sn_uploader.py --url http://10.80.40.57:8099/api/v1/captures --interval 3
+sudo python3 /data/soph_SN/tools/sn_uploader.py --url http://10.80.40.57:8099/api/v1/captures --interval 3
 ```
 
 > - `.57` 产测后端需在 `:8099` 起着（`cd product_test && ./start.sh`）才能接收入库。
-> - 完整接口契约 / 落盘路径 / 排障见 **`SN_CAPTURE_README.md`**（本仓库根目录）。
+> - 接口契约 / 参数说明见 `tools/sn_uploader.py` 头部注释；`sn-uploader.service` 单元在 `deploy/`。
 
 ### 4.7 参数扫描工具 `profile_probe.py`（新模组快速定档）
 
 每上一款**新模组/新板型**，SN 铭牌的位置与占比都变，档位参数（各向异性裁剪 `crop_w/crop_h/crop_cy` + 切块 `tile_grid/tile_up` + ROI 路）得重调。`profile_probe.py` 把这些参数**笛卡尔积扫一遍**，对「图片+期望SN」逐组合报 **耗时 / SN是否命中(带score) / 候选数**，末尾直接给「命中且最快」的推荐组合，可抄进 `PROFILES` 定新档。**只读**：仅跑 OCR，不落库、不上传、不碰在跑的服务。
 
-> 需在**板子上跑**（要 sail 加载 OCR bmodel）。主副本在工作站仓库，和 `sn_monitor.new.py` 一样 scp 到 `/data/soph_SN/` 后运行。
+> 需在**板子上跑**（要 sail 加载 OCR bmodel）。随本仓库 git 部署（`tools/profile_probe.py`），无需单独 scp。
 
 **文件路径**：
 | 项 | 路径 |
 |----|------|
-| 脚本主副本（工作站） | `/media/sophgo/xiaohao.liu/SN_cratch/profile_probe.py` |
-| 脚本部署位置（板子） | `/data/soph_SN/profile_probe.py` |
-| 裁剪图输出目录（默认） | `./profile_probe_out/`（在板子即 `/data/soph_SN/profile_probe_out/`），文件名用 **宽/高/锚点** 组合：`<图名>_cw0.30_ch0.40_cy0.50.jpg`，供人眼核对每种裁剪框住了哪块 |
+| 脚本（仓库内） | `tools/profile_probe.py` |
+| 运行位置（板子，git 部署后） | `/data/soph_SN/tools/profile_probe.py` |
+| 裁剪图输出目录（默认） | `./profile_probe_out/`（在板子即当前工作目录下），文件名用 **宽/高/锚点** 组合：`<图名>_cw0.30_ch0.40_cy0.50.jpg`，供人眼核对每种裁剪框住了哪块。可用 `--out-dir` 改 |
 
 **使用方式**：
 ```bash
-# 部署(工作站→板子)
-scp profile_probe.py linaro@10.80.40.53:/data/soph_SN/
-
 # 板子上跑。先停服务让出摄像头源(本工具只读本地图, 不拉流, 但避免占 NPU)
 sudo systemctl stop sn-monitor
 cd /data/soph_SN
 
 # ① 默认:扫 sn_results/ 下历史命中帧(期望SN从文件名反解), 跑内置常用网格
-sudo python3 profile_probe.py
+sudo python3 tools/profile_probe.py
 
 # ② 指定新模组测试图 + 期望SN(最常用)
-sudo python3 profile_probe.py --jobs "/tmp/newmod_a.jpg:BCXX...,/tmp/newmod_b.jpg:BCYY..."
+sudo python3 tools/profile_probe.py --jobs "/tmp/newmod_a.jpg:BCXX...,/tmp/newmod_b.jpg:BCYY..."
 
 # ③ 自定义扫描网格(收窄范围, 加快)
-sudo python3 profile_probe.py --jobs-file jobs.txt \
+sudo python3 tools/profile_probe.py --jobs-file jobs.txt \
     --crop-w 0.3,0.4,1.0 --crop-h 0.35,0.4 --crop-cy 0.32,0.5 \
     --tile 1x1,2x2 --up 2.0,2.5,3.0 --roi off --rots 0
 ```
@@ -251,7 +304,7 @@ sudo python3 profile_probe.py --jobs-file jobs.txt \
 >> 推荐(命中 2/2 图, 累计 1.66s): cw0.30 ch0.40 cy0.50 1x1@2.5x roi-
    PROFILES 片段: "crop_w":0.3, "crop_h":0.4, "crop_cy":0.5, "tile_grid":(1,1), "tile_up":2.5, "roi_path":False
 ```
-拿推荐行的 `PROFILES 片段` 抄进 `sn_monitor.new.py` 的 `PROFILES` 新增一档，再按 4.5 部署即可。
+拿推荐行的 `PROFILES 片段` 抄进 `sn_monitor.py` 的 `PROFILES` 新增一档，再按 3.4 git 部署即可。
 
 ---
 
@@ -280,9 +333,9 @@ RTSP(4K,TCP) ─► 后台线程持续 read 排空缓冲(只留最新帧)
 FFMPEG 后端 `BUFFERSIZE=1` 无效，直接 read 会回放缓冲里的旧帧。后台线程不停排空解码缓冲，主循环 `latest()` 永远拿最新解码帧，根治旧帧回放。cap 的 read/release 全在该线程做，交接靠 `set_cap`，杜绝跨线程释放崩溃。
 
 **③ 瞬时解码错误不重连（断"重连 churn"自激）。**
-HEVC 常见 `PPS id out of range`（坏包）、`Could not find ref`/`Error constructing RPS`（丢参考帧）都是**瞬时**错误，解码器等下一个 IDR 关键帧自愈。若一见错就 release 重连，会从 GOP 中间重进 → 又一片 ref-error → 重连 churn 自激螺旋。策略：无新鲜帧且解码错在刷时**保持同连接等 IDR**，只有无解码活动持续无帧或超死线(`--wedge-dead-s`)才判真坏流重连。见 `archive` 中 v14 起的修复。
+HEVC 常见 `PPS id out of range`（坏包）、`Could not find ref`/`Error constructing RPS`（丢参考帧）都是**瞬时**错误，解码器等下一个 IDR 关键帧自愈。若一见错就 release 重连，会从 GOP 中间重进 → 又一片 ref-error → 重连 churn 自激螺旋。策略：无新鲜帧且解码错在刷时**保持同连接等 IDR**，只有无解码活动持续无帧或超死线(`--wedge-dead-s`)才判真坏流重连。见第 7 节 V1.4 起的修复。
 
-**④ 各向异性裁剪 + 垂直锚点（v18 档位）。**
+**④ 各向异性裁剪 + 垂直锚点（V2.0.1 档位）。**
 不同板卡 SN 位置不同：小板 SN 在画面**偏上、略偏右**（cy≈0.30），大板居中。用 `crop_w×crop_h`(宽比≠高比) + `crop_cy`(垂直锚点) 只留铭牌带，把板上其它干扰印刷字段（如小板的 `AAAJ2B224AL04`）裁掉，候选池只剩干净 token。
 
 **⑤ 模型闲时释放 + 事件懒加载。**
@@ -300,7 +353,7 @@ HEVC 常见 `PPS id out of range`（坏包）、`Could not find ref`/`Error cons
 **⑨ 结果二次确认门（sncore.result_gate.ResultGate）。**
 vote 出的 SN 不立即落库：需连续 `--confirm` 次同一 SN，或单次分≥`--confirm-score`(0.95) 且满帧命中(强确认)才上报；已上报的同 SN 不重复落库。压制单次误报。
 
-**⑩ 裁剪后"不切片单帧"最准（v18，治好 2→7 错读）。**
+**⑩ 裁剪后"不切片单帧"最准（V2.0.1，治好 2→7 错读）。**
 裁剪收紧后干扰字段已被裁掉，此时**不切片**(`tile_grid=(1,1)`)让 PP-OCR 的 det 自己把 `SN:` 与编码分成**合适大小的框**，编码框长宽比不超标 → 数字读干净。
 > **2→7 根因**：`tile_grid=(1,2)` 切片带 0.3 重叠、切片够宽时把整行 `SN:BCCW6N24070100601` 装进**一个框** → 撞 rec bmodel 宽度天花板 `img_size=[[640,48]]`（长宽比 >13.3 被压扁，曾观测 14.07）→ 数字畸变 2→7，且错读帧分更高被投票选中。改 1×2→1×1 不切片后离线 36/36 确定性读对。
 
@@ -313,7 +366,7 @@ vote 出的 SN 不立即落库：需连续 `--confirm` 次同一 SN，或单次�
 | 拉不到流 / 一直重连 | 摄像头推流是否在推？eth1 `carrier=1`？`ping 192.168.1.9` 通？重启服务后是否重启了摄像头？ |
 | 小板漏识 | **首查摆放**：SN 贴纸面是否朝相机、在右上区？诊断法：拉全幅 miss 帧**网格逐格 OCR** 看 SN 真实 cx/cy（`debug/` 有留证）。若整幅无 SN 即摆错。 |
 | 大板漏识 | 确认加了 `--profile big`(裁剪几何不同)；留证在 `debug/` |
-| 数字错读(如 2→7) | 已由 v18 不切片修复；若复现，确认 profile 的 `tile_grid` 是 (1,1) |
+| 数字错读(如 2→7) | 已由 V2.0.1 不切片修复；若复现，确认 profile 的 `tile_grid` 是 (1,1) |
 | 同一板反复识别 | 已由同板去抖修复；若仍有，适当调大 `--dt` |
 | 反应慢 | 调小 `--poll`(如 0.5) |
 | 模型释放太快/太慢 | 调 `--ocr-idle-unload`(慢→调小，常驻→设 0) |
@@ -328,14 +381,16 @@ ls /data/soph_SN/debug/          # 漏检/待确认留证
 
 ---
 
-## 7. 版本演进（历史备份在 `archive/board_versions/`）
+## 7. 版本演进
 
-| 版本 | 关键改动 |
-|------|----------|
-| v8→v9 | 多帧投票+格式校验落地，常驻服务(TCP/SIGINT/Restart) |
-| v11 | 死亡螺旋修复(瞬时坏包不杀源)，召回硬化(白底∪Sobel)，自适应上采样 |
-| v14 | **断重连 churn**：ref-error 等 IDR 自愈不重连；灭刷屏 |
-| v15 | **提速**：模型常驻 + 渐进式 L1/L2/L3 命中即停 |
-| v16 | 模型闲时释放懒加载 + `--poll` 快轮询降延迟 |
-| v17 | **同板去抖**(静板不重识，连带修好模型释放过晚) |
-| **v18** | **档位系统**(big/small 各向异性裁剪+锚点) + **不切片单帧**(治好 2→7 错读) + 长度门 17。当前稳定版 |
+| 版本 | 阶段 | 关键改动 |
+|------|------|----------|
+| **V0.8 ~ V0.9** | 探索板起步 | 多帧投票 + 格式校验落地；常驻服务(TCP/SIGINT/Restart)；死亡螺旋修复(瞬时坏包不杀源)、召回硬化(白底∪Sobel)、自适应上采样 |
+| **V1.4** | 迭代稳定 | **断重连 churn**：ref-error 等 IDR 自愈不重连，灭刷屏 |
+| **V1.5** | 迭代提速 | 模型常驻 + 渐进式 L1/L2/L3 命中即停 |
+| **V1.6** | 迭代提速 | 模型闲时释放懒加载 + `--poll` 快轮询降延迟 |
+| **V1.7** | 迭代稳定 | **同板去抖**(静板不重识，连带修好模型释放过晚) |
+| **V2.0.1** | ★ 发布版 | **档位系统**(big/small 各向异性裁剪+锚点) + **不切片单帧**(治好 2→7 错读) + 长度门 17。首个对外发布、可 git 部署 |
+| **V2.0.2** | 当前 | 参数扫描工具 `tools/profile_probe.py`(新模组快速定档) + 上传 sidecar `tools/sn_uploader.py` 文档化 + README 发布化(git 部署 / 模型部署 / tools 说明) |
+
+> 版本号约定：`V0.x` 探索板；`V1.x` 迭代稳定/提速；`V2.0.1` 首个发布版；`V2.0.2` 起为发布后增量更新。
