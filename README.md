@@ -54,6 +54,7 @@ SE9 / BM1688 算能板通过 eth1 直连工业摄像头，实时拉 RTSP 流，�
 ```
 sn_monitor.new.py    # ★ 主副本(master), 改这里再部署到板子
 sn_monitor.py     # → 指向 sn_monitor.new.py 的软链
+profile_probe.py     # 参数扫描工具(新模组快速定档, 见 4.7); scp 到板子跑
 sncore/           # 与板子同源
 sn-monitor.service       # service 单元文件
 README.md            # 本文档
@@ -65,6 +66,40 @@ archive/
 ---
 
 ## 4. 使用
+
+> 两种用法二选一：**A. 常驻服务**（生产，放板即识别，无需每次敲命令）；**B. 单条手动指令**（调试/临时，前台跑看实时日志）。
+> 二者都抢同一个**单客户端摄像头源**，不能同时开——手动跑前先 `stop` 服务，跑完再按需 `start`。
+
+### 4.0 快速使用示例（最常用）
+
+**先决**：板子 SSH `linaro@10.80.40.53`；摄像头 `rtsp://192.168.1.9:8554/live0`；工作目录 `/data/soph_SN`。
+
+#### 用法 A —— 常驻服务（生产，一次启用后长期自动跑）
+```bash
+# 启用识别服务（开机自启 + 立即启动）；默认 small(小板)。要监控大板见 4.1 改 ExecStart 加 --profile big
+sudo systemctl enable --now sn-monitor
+# 启用上传 sidecar（把命中结果实时推到 .57 产测前端/DB，详见 4.6）
+sudo systemctl enable --now sn-uploader
+# 之后放板即自动识别 + 自动上传，无需再敲任何命令。看实时日志：
+tail -f /data/soph_SN/logs/sn_monitor.service.log
+```
+
+#### 用法 B —— 不使用服务，单条手动指令（调试）
+```bash
+sudo systemctl stop sn-monitor        # 先停服务让出摄像头源
+
+cd /data/soph_SN
+# ▼ 小板（默认档 small，不带 --profile）
+sudo python3 sn_monitor.py --rtsp rtsp://192.168.1.9:8554/live0 --idle 0
+# ▼ 大板（必须带 --profile big）
+sudo python3 sn_monitor.py --rtsp rtsp://192.168.1.9:8554/live0 --idle 0 --profile big
+# ★ 手动跑也会杀源：本条启动后 / Ctrl-C 结束后，都要同时重启摄像头推流
+
+# 如需上传到前端/DB（可选，另开一个终端；不上传就不用起）：
+sudo python3 /data/soph_SN/sn_uploader.py --url http://10.80.40.57:8099/api/v1/captures --interval 3
+```
+> 大板/小板唯一区别就是 `--profile`（一次切换裁剪几何/上采样/确认门，见 4.3）。
+> 结果落在 `/data/soph_SN/sn_results/`（`sn_<SN>_<ts>.json` + 命中帧 `.jpg`）。
 
 ### 4.1 常驻服务（生产）
 ```bash
@@ -141,6 +176,83 @@ python3 -m py_compile /data/soph_SN/sn_monitor.py
 ```
 > 拷贝 .py 不影响正在跑的进程；生效需重启服务(→ 记得同时重启摄像头)。
 
+### 4.6 实时上传到前端/数据库（sn-uploader sidecar）
+
+识别只负责把结果落到本地 `sn_results/`；**推到 .57 产测系统前端/DB 的是独立 sidecar `sn_uploader.py`**（与识别解耦，纯 urllib，网络故障只重试、`.uploaded` 标记防重传，绝不影响拉流）。
+
+**数据流**：
+```
+放板 ─► sn-monitor(识别) ─► sn_results/  sn_<SN>_<ts>.json + 命中帧.jpg
+     └─► sn-uploader(sidecar) 监视目录, jpg+json 配对 ─► HTTP POST(multipart)
+     └─► http://10.80.40.57:8099/api/v1/captures  (product_test 后端)
+     └─► DB 表 sn_captures + data/sn_captures/<SN>/<ts>.jpg
+       └─► 前端「SN 抓拍」页：按 SN 检索 / 看设备图 + score + 时间
+```
+
+**是否每次都要单独启动？→ 不用。** 板子上把两个服务各 `enable --now` 一次即长期常驻：
+```bash
+sudo systemctl enable --now sn-monitor    # 识别
+sudo systemctl enable --now sn-uploader   # 上传(sidecar 必须 root，否则 .uploaded 写不进→重复上传)
+journalctl -u sn-uploader -f           # 看上传实时日志
+```
+之后放板即「自动识别 → 自动上传 → 前端反映」，全程无需再敲命令。
+
+**只想临时手动上传**（不启用服务时，另开终端）：
+```bash
+sudo python3 /data/soph_SN/sn_uploader.py --url http://10.80.40.57:8099/api/v1/captures --interval 3
+```
+
+> - `.57` 产测后端需在 `:8099` 起着（`cd product_test && ./start.sh`）才能接收入库。
+> - 完整接口契约 / 落盘路径 / 排障见 **`SN_CAPTURE_README.md`**（本仓库根目录）。
+
+### 4.7 参数扫描工具 `profile_probe.py`（新模组快速定档）
+
+每上一款**新模组/新板型**，SN 铭牌的位置与占比都变，档位参数（各向异性裁剪 `crop_w/crop_h/crop_cy` + 切块 `tile_grid/tile_up` + ROI 路）得重调。`profile_probe.py` 把这些参数**笛卡尔积扫一遍**，对「图片+期望SN」逐组合报 **耗时 / SN是否命中(带score) / 候选数**，末尾直接给「命中且最快」的推荐组合，可抄进 `PROFILES` 定新档。**只读**：仅跑 OCR，不落库、不上传、不碰在跑的服务。
+
+> 需在**板子上跑**（要 sail 加载 OCR bmodel）。主副本在工作站仓库，和 `sn_monitor.new.py` 一样 scp 到 `/data/soph_SN/` 后运行。
+
+**文件路径**：
+| 项 | 路径 |
+|----|------|
+| 脚本主副本（工作站） | `/media/sophgo/xiaohao.liu/SN_cratch/profile_probe.py` |
+| 脚本部署位置（板子） | `/data/soph_SN/profile_probe.py` |
+| 裁剪图输出目录（默认） | `./profile_probe_out/`（在板子即 `/data/soph_SN/profile_probe_out/`），文件名用 **宽/高/锚点** 组合：`<图名>_cw0.30_ch0.40_cy0.50.jpg`，供人眼核对每种裁剪框住了哪块 |
+
+**使用方式**：
+```bash
+# 部署(工作站→板子)
+scp profile_probe.py linaro@10.80.40.53:/data/soph_SN/
+
+# 板子上跑。先停服务让出摄像头源(本工具只读本地图, 不拉流, 但避免占 NPU)
+sudo systemctl stop sn-monitor
+cd /data/soph_SN
+
+# ① 默认:扫 sn_results/ 下历史命中帧(期望SN从文件名反解), 跑内置常用网格
+sudo python3 profile_probe.py
+
+# ② 指定新模组测试图 + 期望SN(最常用)
+sudo python3 profile_probe.py --jobs "/tmp/newmod_a.jpg:BCXX...,/tmp/newmod_b.jpg:BCYY..."
+
+# ③ 自定义扫描网格(收窄范围, 加快)
+sudo python3 profile_probe.py --jobs-file jobs.txt \
+    --crop-w 0.3,0.4,1.0 --crop-h 0.35,0.4 --crop-cy 0.32,0.5 \
+    --tile 1x1,2x2 --up 2.0,2.5,3.0 --roi off --rots 0
+```
+> `--jobs-file` 每行 `路径 期望SN`（空格/冒号分隔，`#` 开头为注释）。默认网格约 100+ 组合/图，用 `--crop-w` 等收窄可显著提速。
+
+**预期输出形式**：
+```
+[probe] 2 图 × 108 组合; 裁剪图→ /data/soph_SN/profile_probe_out
+
+#### newmod_a.jpg want=BCXX... 尺寸3840x2160 ####
+  cw0.30 ch0.40 cy0.50 1x1@2.5x roi- | 0.83s | SN=✅0.971 | 候选 6
+  cw0.40 ch0.35 cy0.32 1x1@3.0x roi- | 0.91s | SN=❌    | 候选 4
+  ...
+>> 推荐(命中 2/2 图, 累计 1.66s): cw0.30 ch0.40 cy0.50 1x1@2.5x roi-
+   PROFILES 片段: "crop_w":0.3, "crop_h":0.4, "crop_cy":0.5, "tile_grid":(1,1), "tile_up":2.5, "roi_path":False
+```
+拿推荐行的 `PROFILES 片段` 抄进 `sn_monitor.new.py` 的 `PROFILES` 新增一档，再按 4.5 部署即可。
+
 ---
 
 ## 5. 实现原理
@@ -154,7 +266,9 @@ RTSP(4K,TCP) ─► 后台线程持续 read 排空缓冲(只留最新帧)
           质量门 ─► 运动/稳定状态机 ─► 铭牌检测(白底标签∪Sobel条码)
    │(稳定+有铭牌+非同板)
             ▼
-     按档位裁剪+(不)切片 单帧识别 ─► 多帧投票+格式校验 ─► 二次确认门 ─► 落库
+          按档位裁剪+(不)切片 单帧识别 ─► 多帧投票+格式校验 ─► 二次确认门 ─► 落库
+       │
+     (可选) sn-uploader sidecar ─► POST 到 .57 product_test ─► DB + 前端「SN 抓拍」页
 ```
 
 ### 5.2 关键设计决策（每条都对应踩过的坑）
