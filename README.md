@@ -325,6 +325,32 @@ sudo python3 tools/profile_probe.py --jobs-file jobs.txt \
 ```
 拿推荐行的 `PROFILES 片段` 抄进 `sn_monitor.py` 的 `PROFILES` 新增一档，再按 3.4 git 部署即可。
 
+### 4.8 v2.1 双路摄像头（正/反两面抓拍）
+
+一个工位加**第二路摄像头**对着板卡**背面**，**只拉流不识别**：在摄像头1识别命中的那一刻**同步抓一帧背面图**，正反两张一并上传、在产测网页端**成对展示**。
+
+**设备能力**：BM1688 有 2 个硬件视频解码核（`/proc/soph/vpuinfo` 的 `vdec_coreid 1/2`），两路 4K HEVC 分到两核上吃得下；背面只在命中瞬间取单帧、不做连续 OCR，负载更低。
+
+**怎么开**：给 `--rtsp` 之外再加一个 `--rtsp2`。空/不加 = 单路（行为完全等同 V2.0.x，现有小/大板零影响）。
+
+| 参数 | 默认 | 说明 |
+|------|------|------|
+| `--rtsp2` | (空) | 第二路（背面）RTSP。空=不开第二路。IP 调通后填 `rtsp://<cam2-ip>:8554/live0` |
+| `--rtsp2-grab-wait` | 0.5 | 命中时从第二路取最新帧的最大阻塞秒（小值防拖慢主识别） |
+
+服务方式：`deploy/sn-monitor.service`（及 big 单元）的 `ExecStart` 末尾追加 `--rtsp2 rtsp://<cam2-ip>:8554/live0` 即可（单元里已留注释占位）。
+
+```bash
+# 手动前台（调试）：
+sudo python3 sn_monitor.py --rtsp rtsp://192.168.1.9:8554/live0 --idle 0 --rtsp2 rtsp://<cam2-ip>:8554/live0
+```
+
+**落盘/上传**：正面仍 `sn_<SN>_<ts>.jpg`+`.json`（JSON 多一个 `"side":"front"`）；背面另存 `sn_<SN>_<ts>_back.jpg`+`_back.json`（`"side":"back"`，`sn/ts/score` 继承正面）。`sn-uploader` 靠 glob `sn_*.jpg` 两张都拾取，POST 带 `side`；正反用**同一 ISO 时刻**上传 → `.57` DB 两行 `captured_at` 一致 → 前端按 `sn+captured_at` 配对成一张卡片并排显示正/反。
+
+**降级与容错**：`--rtsp2` 未配或拉不到流 → 自动降级为单路，背面抓拍跳过，**绝不阻塞/影响正面识别落库**。第二路断线自愈（周期重连）本版未做，命中拿不到背面帧即跳过。
+
+> ⚠️ 第二路同样是**单客户端源**：停/重启服务会断开背面摄像头，需同时重启其推流（与铁律 1 一致）。
+
 ---
 
 ## 5. 实现原理

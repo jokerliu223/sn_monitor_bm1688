@@ -407,6 +407,18 @@ def save_hit_image(results_dir, sn, ts, frame):
     return path
 
 
+def save_back_result(results_dir, sn, ts, ts_iso, frame, score):
+    """v2.1 背面(第二路)留证: 存图 sn_{sn}_{ts}_back.jpg + 配对 JSON(side=back)。
+    背面不识别, sn/ts/score 继承正面; ts_iso 与正面同值 -> .57 captured_at 一致, 前端按(sn,captured_at)配对成对显示。
+    命名带 _back 后缀, 不与正面 sn_{sn}_{ts}.* 冲突; uploader 的 glob sn_*.jpg 天然拾取, 同名 _back.json 配对上传。"""
+    jpg = os.path.join(results_dir, f"sn_{sn}_{ts}_back.jpg")
+    cv2.imwrite(jpg, frame)
+    meta = {"sn": sn, "score": float(score), "ts": ts_iso, "side": "back"}
+    with open(os.path.join(results_dir, f"sn_{sn}_{ts}_back.json"), 'w') as f:
+        json.dump(meta, f, ensure_ascii=False, indent=2)
+    return jpg
+
+
 def open_cap(rtsp):
     """统一建流入口: FFMPEG 后端 + 小缓冲(取最新帧)。"""
     cap = cv2.VideoCapture(rtsp, cv2.CAP_FFMPEG)
@@ -464,6 +476,11 @@ def reconnect(rtsp, probe_gap=3, alert_after=5):
 def main():
     p = argparse.ArgumentParser(description="SN v10")
     p.add_argument("--rtsp", required=True)
+    # v2.1 第二路摄像头(背面): 只拉流不识别, 命中瞬间抓一帧背面图。空=双路关闭, 行为完全等同单路(V2.0.2)
+    p.add_argument("--rtsp2", type=str, default="",
+                   help="第二路(背面)RTSP; 空=不开第二路(单路)。IP调通后填 rtsp://<cam2>:8554/live0")
+    p.add_argument("--rtsp2-grab-wait", type=float, default=0.5, dest="rtsp2_grab_wait",
+                   help="命中时从第二路取最新帧的最大阻塞秒(小值防拖慢主识别)")
     p.add_argument("--n", type=int, default=3)
     p.add_argument("--fi", type=float, default=1.0)
     p.add_argument("--mi", type=float, default=5.0, help="监控间隔(秒), 慢一点减少HEVC压力")
@@ -574,6 +591,17 @@ def main():
     print(f"  流: {int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))}x{int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))}")
     reader = FrameReader()          # 后台线程持续排空缓冲, 主循环只取最新帧
     reader.set_cap(cap)
+
+    # v2.1 第二路(背面)只拉流: 复用 FrameReader; 空 --rtsp2 = 双路关(reader2=None, 全程 if reader2 守卫, 单路路径不变)
+    reader2 = None
+    if args.rtsp2:
+        cap2 = open_verified(args.rtsp2)   # 拉不到不阻塞重试, 直接降级单路(等 camera2 IP 调通再用)
+        if cap2 is not None:
+            reader2 = FrameReader(); reader2.set_cap(cap2)
+            print(f"  第二路(背面): {int(cap2.get(cv2.CAP_PROP_FRAME_WIDTH))}x{int(cap2.get(cv2.CAP_PROP_FRAME_HEIGHT))}")
+        else:
+            print(f"  ⚠ 第二路 {args.rtsp2} 暂不可达, 本次降级为单路(仅正面), 背面抓拍跳过")
+
     print("\n[监控启动]\n")
 
     try:
@@ -663,6 +691,8 @@ def main():
             voted = None; lock_now = False   # 修B:仅report/dup锁板,pending/miss不锁以重试
             last_event = time.time()   # 本次事件, 刷新闲时计时
             recog_ref = frame.copy()   # 记住本次识别的画面, 供同板去抖对比
+            # v2.1: 识别起点顺手抓背面最新帧(与正面 frames[0] 时间最接近, 避免 OCR 耗时后两面不同板); 命中确认时才落盘
+            back_frame = reader2.latest(wait=args.rtsp2_grab_wait)[0] if reader2 else None
             try:
                 eng.load()   # 懒加载: 闲时已释放则此处重加载(常驻时秒回空操作)
                 t0 = time.time()
@@ -710,17 +740,25 @@ def main():
                               f"命中={voted['frames_hit']}/{voted['total_frames']} "
                               f"合并={voted['merged']} (确认{cnt}次)")
                         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                        ts_iso = datetime.now().isoformat()   # v2.1 正反共用同一 ISO 时刻 -> .57 captured_at 一致, 前端可配对
                         with open(os.path.join(RESULTS_DIR, f"sn_{voted['sn']}_{ts}.json"),'w') as f:
-                            json.dump(jsonable({**voted, "ts":datetime.now().isoformat(),
+                            json.dump(jsonable({**voted, "ts":ts_iso, "side":"front",
                                                 "frame_texts":frame_texts}), f, ensure_ascii=False, indent=2)
                         with open(os.path.join(RESULTS_DIR,"sn_list.txt"),'a') as f:
                             f.write(f"{voted['sn']}\t{voted['score']:.3f}\t{ts}\n")
-                        # 存命中帧作为绑定图（供产测系统展示；失败不影响落库）
+                        # 存正面命中帧作为绑定图（供产测系统展示；失败不影响落库）
                         try:
                             if frames:
                                 save_hit_image(RESULTS_DIR, voted['sn'], ts, frames[0])
                         except Exception as _e:
                             print(f"  ⚠ 存命中帧失败: {_e}")
+                        # v2.1 背面留证(第二路): 抓到才存, 拿不到就跳过(不影响正面落库)
+                        try:
+                            if back_frame is not None:
+                                save_back_result(RESULTS_DIR, voted['sn'], ts, ts_iso, back_frame, voted['score'])
+                                print(f"  📷 背面留证 sn_{voted['sn']}_{ts}_back.jpg")
+                        except Exception as _e:
+                            print(f"  ⚠ 存背面帧失败: {_e}")
                     elif action == "dup":
                         lock_now = True
                         print(f"\n  ↩ SN={voted['sn']} 已上报过, 不重复落库")
@@ -755,6 +793,10 @@ def main():
         reader.set_cap(None)      # 让线程 release 当前 cap(发 TEARDOWN, 保住下次可拉流)
         reader.wait_released(3.0)
         reader.run = False
+        if reader2:               # v2.1 第二路对称清理: 单客户端源必须发 TEARDOWN, 否则背面摄像头下次拉不到流
+            reader2.set_cap(None)
+            reader2.wait_released(3.0)
+            reader2.run = False
         print(f"统计: 监控{mon}次 SN{sn_cnt}个")
 
 if __name__ == "__main__":
