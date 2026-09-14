@@ -1,0 +1,24 @@
+[Unit]
+Description=SN Monitor (RTSP -> PP-OCR) big-board persistent
+After=network-online.target
+Wants=network-online.target
+# 单客户端摄像头源同一路只能一个进程拉流: 与 small 档服务互斥, 启一个自动停另一个, 杜绝抢流打架
+Conflicts=sn-monitor.service
+
+[Service]
+Type=simple
+User=root
+Environment=PYTHONUNBUFFERED=1
+WorkingDirectory=/data/soph_SN
+# 与 sn-monitor.service 唯一差别: 写死 --profile big(大板裁剪几何/上采样/确认门), 免手改 ExecStart
+ExecStart=/usr/bin/python3 /data/soph_SN/sn_monitor.py --rtsp rtsp://192.168.1.9:8554/live0 --idle 0 --mi 5 --profile big
+Restart=always
+RestartSec=5
+# stop 时发 SIGINT -> 干净退出(release 发 TEARDOWN)
+KillSignal=SIGINT
+TimeoutStopSec=15
+StandardOutput=append:/data/soph_SN/logs/sn_monitor.service.log
+StandardError=append:/data/soph_SN/logs/sn_monitor.service.log
+
+[Install]
+WantedBy=multi-user.target

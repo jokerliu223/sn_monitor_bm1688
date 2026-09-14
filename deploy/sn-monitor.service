@@ -1,7 +1,9 @@
 [Unit]
-Description=SN Monitor (RTSP -> PP-OCR) v9 persistent
+Description=SN Monitor (RTSP -> PP-OCR) small-board persistent
 After=network-online.target
 Wants=network-online.target
+# 单客户端摄像头源同一路只能一个进程拉流: 与 big 档服务互斥, 启一个自动停另一个, 杜绝抢流打架
+Conflicts=sn-monitor-big.service
 
 [Service]
 Type=simple
