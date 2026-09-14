@@ -64,7 +64,8 @@ git 部署后的代码 + 3.3 装好的模型/框架，在板子上合成如下�
   logs/                  # 运行时：服务日志 sn_monitor.service.log（不进 journalctl）
   sn_results/            # 运行时：识别结果 JSON + sn_list.txt（目录名是 sn_results 不是 results）
   debug/                 # 运行时：漏检/待确认留证（原帧+ROI+候选，限 40 组）
-/etc/systemd/system/sn-monitor.service     # ← deploy/sn-monitor.service 拷入
+/etc/systemd/system/sn-monitor.service       # ← deploy/sn-monitor.service 拷入（小板）
+/etc/systemd/system/sn-monitor-big.service   # ← deploy/sn-monitor-big.service 拷入（大板；与上互斥，按工位启一个）
 ```
 
 ### 3.3 模型 / 框架部署（PP-OCR bmodel + sail，一次性）
@@ -111,7 +112,7 @@ cd /data && git clone <本仓库地址> soph_SN     # 或克隆到别处再软�
 # 之后更新：板子上直接拉最新代码
 cd /data/soph_SN && git pull
 python3 -m py_compile sn_monitor.py tools/*.py     # 语法自检
-sudo cp deploy/sn-monitor.service /etc/systemd/system/ && sudo systemctl daemon-reload   # service 有变更时
+sudo cp deploy/sn-monitor.service deploy/sn-monitor-big.service /etc/systemd/system/ && sudo systemctl daemon-reload   # service 有变更时
 sudo systemctl restart sn-monitor                  # 生效（★ 记得同时重启摄像头推流！）
 ```
 > `git pull` 不影响正在跑的进程；生效才需 `restart`。`logs/`、`sn_results/`、`sophon-demo/` 已 `.gitignore`，`git pull` 不会动它们。
@@ -136,14 +137,21 @@ sudo systemctl restart sn-monitor                  # 生效（★ 记得同时�
 **先决**：板子 SSH `linaro@10.80.40.53`；摄像头 `rtsp://192.168.1.9:8554/live0`；工作目录 `/data/soph_SN`。
 
 #### 用法 A —— 常驻服务（生产，一次启用后长期自动跑）
+> **一个工位固定一种板子**：按板型选对应服务，两者写死了各自档位，**无需手改 ExecStart**。
+> 二者互斥（`Conflicts=`，单客户端源只能一个进程拉流），enable 其一会自动停掉另一个。
+
 ```bash
-# 启用识别服务（开机自启 + 立即启动）；默认 small(小板)。要监控大板见 4.1 改 ExecStart 加 --profile big
+# ▼ 小板工位：启用 small 档识别服务（开机自启 + 立即启动）
 sudo systemctl enable --now sn-monitor
+# ▼ 大板工位：改用 big 档服务（二选一，不要和上面同时 enable）
+sudo systemctl enable --now sn-monitor-big
+
 # 启用上传 sidecar（把命中结果实时推到 .57 产测前端/DB，详见 4.6）
 sudo systemctl enable --now sn-uploader
 # 之后放板即自动识别 + 自动上传，无需再敲任何命令。看实时日志：
 tail -f /data/soph_SN/logs/sn_monitor.service.log
 ```
+> 换板型时先停旧的：小板→大板 `sudo systemctl disable --now sn-monitor && sudo systemctl enable --now sn-monitor-big`（反之亦然）。
 
 #### 用法 B —— 不使用服务，单条手动指令（调试）
 ```bash
@@ -163,19 +171,30 @@ sudo python3 /data/soph_SN/tools/sn_uploader.py --url http://10.80.40.57:8099/ap
 > 结果落在 `/data/soph_SN/sn_results/`（`sn_<SN>_<ts>.json` + 命中帧 `.jpg`）。
 
 ### 4.1 常驻服务（生产）
+
+**两个服务单元，按板型二选一**（`deploy/` 下，`git pull` 即带；装法见 3.4）：
+
+| 服务 | 板型 | ExecStart 档位 | 日志 |
+|------|------|----------------|------|
+| `sn-monitor.service` | 小板 | `--profile small`（默认，不写即 small） | `logs/sn_monitor.service.log` |
+| `sn-monitor-big.service` | 大板 | 写死 `--profile big` | 同上 |
+
+两者含 `Conflicts=`，**同一路摄像头只能起一个**；enable 其一会自动停另一个。把 `<svc>` 换成实际用的那个：
+
 ```bash
-sudo systemctl start   sn-monitor      # 启动
-sudo systemctl stop    sn-monitor      # 停止(会杀源, 需配合摄像头)
-sudo systemctl restart sn-monitor# 重启(务必同时重启摄像头推流!)
-sudo systemctl status  sn-monitor
+sudo systemctl start   <svc>      # 启动（<svc>=sn-monitor 或 sn-monitor-big）
+sudo systemctl stop    <svc>      # 停止(会杀源, 需配合摄像头)
+sudo systemctl restart <svc>      # 重启(务必同时重启摄像头推流!)
+sudo systemctl status  <svc>
 tail -f /data/soph_SN/logs/sn_monitor.service.log
 ```
-service 的 `ExecStart`：
+小板 `ExecStart`：
 ```
 /usr/bin/python3 /data/soph_SN/sn_monitor.py --rtsp rtsp://192.168.1.9:8554/live0 --idle 0 --mi 5
 ```
-不带 `--profile` → 用默认档 **small**（监控小板）。若这台要监控**大板**，把 `--profile big` 加进 `ExecStart`。
+大板 `ExecStart`：同上末尾多 `--profile big`。
 配置：`--idle 0`（永不超时）、`KillSignal=SIGINT`（干净 TEARDOWN 保住下次可拉流）、`Restart=always`。
+> 若还是想用一个服务临时切档，也可手改对应单元的 `ExecStart` 再 `daemon-reload`——但固定工位推荐直接用上面两个现成单元。
 
 ### 4.2 手动前台跑（调试，最直观）
 ```bash
@@ -243,11 +262,11 @@ sudo python3 sn_monitor.py --rtsp rtsp://192.168.1.9:8554/live0 --idle 0 --profi
 
 **是否每次都要单独启动？→ 不用。** 板子上把两个服务各 `enable --now` 一次即长期常驻：
 ```bash
-# 首次：从 deploy/ 装单元（已装过可跳过）
-sudo cp /data/soph_SN/deploy/sn-monitor.service /data/soph_SN/deploy/sn-uploader.service /etc/systemd/system/
+# 首次：从 deploy/ 装单元（已装过可跳过；big 单元一并拷入，按工位启用其一）
+sudo cp /data/soph_SN/deploy/sn-monitor.service /data/soph_SN/deploy/sn-monitor-big.service /data/soph_SN/deploy/sn-uploader.service /etc/systemd/system/
 sudo systemctl daemon-reload
 # 启用（开机自启 + 立即启动）
-sudo systemctl enable --now sn-monitor    # 识别
+sudo systemctl enable --now sn-monitor    # 识别(小板；大板工位改用 sn-monitor-big，二选一)
 sudo systemctl enable --now sn-uploader   # 上传(sidecar 必须 root，否则 .uploaded 写不进→重复上传)
 journalctl -u sn-uploader -f           # 看上传实时日志
 ```
