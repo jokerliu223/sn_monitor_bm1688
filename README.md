@@ -94,8 +94,9 @@ sn_monitor_bm1688/
     sn_uploader.py       #   命中结果 sidecar：上传 SN+命中帧到 .57 产测系统（见 4.6）
     profile_probe.py     #   参数扫描工具：新模组快速定档（见 4.7）
   deploy/
-    sn-monitor.service   #   识别服务 systemd 单元（拷到 /etc/systemd/system/ 用）
-    sn-uploader.service  #   上传 sidecar systemd 单元（可选，见 4.6）
+    sn-monitor.service       #   识别服务 systemd 单元（小板，单路；拷到 /etc/systemd/system/ 用）
+    sn-monitor-big.service   #   识别服务 systemd 单元（大板，档位 big + 双路 --rtsp2）
+    sn-uploader.service      #   上传 sidecar systemd 单元（可选，见 4.6）
   README.md              # 本文档
   .gitignore             # 排除模型/框架/运行时产物（见 3.3：这些不进 git）
 ```
@@ -125,8 +126,8 @@ git 部署后的代码 + 3.3 装好的模型/框架，在板子上合成如下�
   logs/                  # 运行时：服务日志 sn_monitor.service.log（不进 journalctl）
   sn_results/            # 运行时：识别结果 JSON + sn_list.txt（目录名是 sn_results 不是 results）
   debug/                 # 运行时：漏检/待确认留证（原帧+ROI+候选，限 40 组）
-/etc/systemd/system/sn-monitor.service       # ← deploy/sn-monitor.service 拷入（小板）
-/etc/systemd/system/sn-monitor-big.service   # ← deploy/sn-monitor-big.service 拷入（大板；与上互斥，按工位启一个）
+/etc/systemd/system/sn-monitor.service       # ← deploy/sn-monitor.service 拷入（小板，单路）
+/etc/systemd/system/sn-monitor-big.service   # ← deploy/sn-monitor-big.service 拷入（大板，big 档 + 双路；与上互斥，按工位启一个）
 /etc/systemd/system/sn-uploader.service      # ← deploy/sn-uploader.service 拷入（上传 sidecar，见 4.6）
 ```
 
@@ -177,7 +178,7 @@ cd /data && git clone <本仓库地址> soph_SN     # 或克隆到别处再软�
 # 之后更新：板子上直接拉最新代码
 cd /data/soph_SN && git pull
 python3 -m py_compile sn_monitor.py tools/*.py     # 语法自检
-sudo cp deploy/sn-monitor.service deploy/sn-monitor-big.service /etc/systemd/system/ && sudo systemctl daemon-reload   # service 有变更时
+sudo cp deploy/sn-monitor.service deploy/sn-monitor-big.service /etc/systemd/system/ && sudo systemctl daemon-reload   # service 有变更时（⚠️ 会覆盖 /etc 里手改过的版本，先备份）
 sudo systemctl restart sn-monitor                  # 生效（★ 记得同时重启摄像头推流！）
 ```
 > `git pull` 不影响正在跑的进程；生效才需 `restart`。`logs/`、`sn_results/`、`sophon-demo/` 已 `.gitignore`，`git pull` 不会动它们。
@@ -218,7 +219,10 @@ tail -f /data/soph_SN/logs/sn_monitor.service.log
 ```
 > 换板型时先停旧的：小板→大板 `sudo systemctl disable --now sn-monitor && sudo systemctl enable --now sn-monitor-big`（反之亦然）。
 >
-> **要用双路（V2.1 正/反两面）**：这两个单元的 `ExecStart` 里**没有** `--rtsp2`（保持单路兼容）。启用前先编辑单元、在末尾追加 `--rtsp2 rtsp://192.168.1.8:8554/live0`，再 `daemon-reload && restart`。详见 4.8。
+> **大板工位默认就是双路**：`sn-monitor-big.service` 的 `ExecStart` 里已写死 `--rtsp2 rtsp://192.168.1.8:8554/live0`，**开箱即抓正/反两面，不用手改**。只装一台相机的大板工位，把它删掉即可回到单路。
+> 小板单元 `sn-monitor.service` 是**单路**，要用双路得自己往末尾追加 `--rtsp2 ...`，再 `daemon-reload && restart`。详见 4.8。
+>
+> ⚠️ 这两个单元就是从 `deploy/` 拷进 `/etc/systemd/system/` 的，**部署时覆盖会冲掉本地手改的 IP/参数**，见 4.1 的警告。
 
 #### 用法 B —— 不使用服务，单条手动指令（调试）
 ```bash
@@ -248,7 +252,15 @@ sudo python3 /data/soph_SN/tools/sn_uploader.py --url http://10.80.40.57:8099/ap
 | 服务 | 板型 | ExecStart 档位 | 日志 |
 |------|------|----------------|------|
 | `sn-monitor.service` | 小板 | `--profile small`（默认，不写即 small） | `logs/sn_monitor.service.log` |
-| `sn-monitor-big.service` | 大板 | 写死 `--profile big` | 同上 |
+| `sn-monitor-big.service` | 大板 | 写死 `--profile big` + **`--rtsp2` 双路** | 同上 |
+
+> `sn-monitor-big.service` **本身带 `--rtsp2`（双路）**——大板工位默认就抓正/反两路。若某个大板工位只装了一台相机，把该行末尾的 `--rtsp2 ...` 删掉即可（不加就是 V2.0.x 单路行为）。`sn-monitor.service`（小板）则保持单路，需要双路时自己补 `--rtsp2`。
+
+> ⚠️ **这两个单元就是从 `deploy/` 拷到 `/etc/systemd/system/` 的**。正常部署流程 `git pull` + `cp deploy/*.service /etc/systemd/system/` 会**覆盖本地改过的版本**——在 `/etc` 里手改过摄像头 IP 或档位的工位，覆盖前先备份：
+> ```bash
+> sudo cp /etc/systemd/system/sn-monitor-big.service /etc/systemd/system/sn-monitor-big.service.local_bak
+> ```
+> 覆盖后务必确认 `ExecStart` 里仍带着需要的 `--rtsp2`。
 
 两者含 `Conflicts=`，**同一路摄像头只能起一个**；enable 其一会自动停另一个。把 `<svc>` 换成实际用的那个：
 
@@ -263,7 +275,7 @@ tail -f /data/soph_SN/logs/sn_monitor.service.log
 ```
 /usr/bin/python3 /data/soph_SN/sn_monitor.py --rtsp rtsp://192.168.1.9:8554/live0 --idle 0 --mi 5
 ```
-大板 `ExecStart`：同上末尾多 `--profile big`。
+大板 `ExecStart`：同上末尾多 `--profile big` **和 `--rtsp2 rtsp://192.168.1.8:8554/live0`（双路，背面相机）**。
 配置：`--idle 0`（永不超时）、`KillSignal=SIGINT`（干净 TEARDOWN 保住下次可拉流）、`Restart=always`。
 > 若还是想用一个服务临时切档，也可手改对应单元的 `ExecStart` 再 `daemon-reload`——但固定工位推荐直接用上面两个现成单元。
 
@@ -339,10 +351,11 @@ sudo python3 sn_monitor.py --rtsp rtsp://192.168.1.9:8554/live0 --idle 0 --profi
 **是否每次都要单独启动？→ 不用。** 板子上把两个服务各 `enable --now` 一次即长期常驻：
 ```bash
 # 首次：从 deploy/ 装单元（已装过可跳过；big 单元一并拷入，按工位启用其一）
+# ⚠️ 就地覆盖会冲掉 /etc 里手改过的 IP/档位——改过的先备份，见 4.1
 sudo cp /data/soph_SN/deploy/sn-monitor.service /data/soph_SN/deploy/sn-monitor-big.service /data/soph_SN/deploy/sn-uploader.service /etc/systemd/system/
 sudo systemctl daemon-reload
 # 启用（开机自启 + 立即启动）
-sudo systemctl enable --now sn-monitor    # 识别(小板；大板工位改用 sn-monitor-big，二选一)
+sudo systemctl enable --now sn-monitor    # 识别(小板，单路；大板工位改用 sn-monitor-big，二选一)
 sudo systemctl enable --now sn-uploader   # 上传(sidecar 必须 root，否则 .uploaded 写不进→重复上传)
 journalctl -u sn-uploader -f           # 看上传实时日志
 ```
@@ -454,12 +467,20 @@ ping -c1 192.168.1.8                                    # 通不通
 timeout 4 bash -c "cat < /dev/null > /dev/tcp/192.168.1.8/8554" && echo 8554可连
 ```
 
-**生产（服务方式）**：编辑 `deploy/sn-monitor*.service` 的 `ExecStart`，末尾追加 `--rtsp2`（单元里已留注释占位），然后：
+**生产（服务方式）**：**大板工位什么都不用改** —— `deploy/sn-monitor-big.service` 的 `ExecStart` 里已经写好了 `--rtsp2`，拷进去启用即双路：
 
 ```bash
 sudo cp deploy/sn-monitor-big.service /etc/systemd/system/
 sudo systemctl daemon-reload
-sudo systemctl restart sn-monitor-big
+sudo systemctl enable --now sn-monitor-big
+```
+
+**小板工位**（`sn-monitor.service` 是单路）才需要手动补：编辑该单元的 `ExecStart`，末尾追加 `--rtsp2 rtsp://192.168.1.8:8554/live0`，然后：
+
+```bash
+sudo cp deploy/sn-monitor.service /etc/systemd/system/   # 或直接在 /etc 里改
+sudo systemctl daemon-reload
+sudo systemctl restart sn-monitor
 ```
 
 当前板子上跑的就是这行（`sn-monitor-big.service`）：
@@ -479,6 +500,12 @@ sudo python3 sn_monitor.py --rtsp rtsp://192.168.1.9:8554/live0 \
   第二路(背面): 3840x2160
 ```
 若第二路不通，会打印 `⚠ 第二路 ... 暂不可达, 本次降级为单路(仅正面), 背面抓拍跳过` 然后照常单路运行——**这是刻意设计：不阻塞重试、直接降级**，等相机调通再重启服务即可。
+
+> 手动前台跑**只管识别**，不管上传。要上传得**另开一个终端**跑 uploader（长驻，`Ctrl-C` 停）：
+> ```bash
+> sudo python3 tools/sn_uploader.py --url http://10.80.40.57:8099/api/v1/captures --interval 3
+> ```
+> **生产环境不用这么麻烦**：`sn-uploader.service` 已 enable，开机随 `sn-monitor*` 一起常驻，两个服务各占一个后台进程、互不干扰——只有"手动前台调试"这种非服务方式，才需要自己多开一个窗口。双路也不额外增加终端：一张正面图 + 一张背面图由同一个 uploader 一起拾取上传。
 
 > **注意**：第二路**不做**断线自愈（周期重连）。跑起来之后若背面相机掉线，本进程不会自动接回来，需重启服务。正面那一路的自愈机制不受影响。
 
@@ -623,6 +650,6 @@ ls /data/soph_SN/debug/          # 漏检/待确认留证
 | **V1.7** | 迭代稳定 | **同板去抖**(静板不重识，连带修好模型释放过晚) |
 | **V2.0.1** | ★ 发布版 | **档位系统**(big/small 各向异性裁剪+锚点) + **不切片单帧**(治好 2→7 错读) + 长度门 17。首个对外发布、可 git 部署 |
 | **V2.0.2** | 发布后增量 | 参数扫描工具 `tools/profile_probe.py`(新模组快速定档) + 上传 sidecar `tools/sn_uploader.py` 文档化 + README 发布化(git 部署 / 模型部署 / tools 说明) |
-| **V2.1** | ★ 当前 | **双路摄像头**(`--rtsp2` 正面识别命中时同步抓背面一帧,正反配对上传,见 4.8) + `.57` 产测端 `side` 字段与正/反配对展示 + `sn-uploader.service` 修正(路径兼容两种布局、补 `--interval`) |
+| **V2.1** | ★ 当前 | **双路摄像头**(`--rtsp2` 正面识别命中时同步抓背面一帧,正反配对上传,见 4.8) + `.57` 产测端 `side` 字段与正/反配对展示 + `sn-uploader.service` 修正(路径兼容两种布局、补 `--interval`) + **`sn-monitor-big.service` 内置双路**(大板工位开箱即双路,不再需要手改 ExecStart) |
 
 > 版本号约定：`V0.x` 探索板；`V1.x` 迭代稳定/提速；`V2.0.1` 首个发布版；`V2.0.2` 起为发布后增量更新。
