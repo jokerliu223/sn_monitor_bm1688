@@ -1,5 +1,5 @@
 [Unit]
-Description=SN Monitor (RTSP -> PP-OCR) big-board persistent
+Description=SN Monitor (RTSP -> PP-OCR) big-board persistent, dual-camera
 After=network-online.target
 Wants=network-online.target
 # 单客户端摄像头源同一路只能一个进程拉流: 与 small 档服务互斥, 启一个自动停另一个, 杜绝抢流打架
@@ -10,9 +10,10 @@ Type=simple
 User=root
 Environment=PYTHONUNBUFFERED=1
 WorkingDirectory=/data/soph_SN
-# 与 sn-monitor.service 唯一差别: 写死 --profile big(大板裁剪几何/上采样/确认门), 免手改 ExecStart
-# v2.1 第二路(背面)就绪后, 在下行末尾追加: --rtsp2 rtsp://<cam2-ip>:8554/live0  (不加=单路, 零影响)
-ExecStart=/usr/bin/python3 /data/soph_SN/sn_monitor.py --rtsp rtsp://192.168.1.9:8554/live0 --idle 0 --mi 5 --profile big
+# 与 sn-monitor.service 的两点差别: ① 写死 --profile big(大板裁剪几何/上采样/确认门);
+# ② 带 --rtsp2 双路(背面相机只抓帧不识别, 见 README 4.8)。
+# 摄像头 IP 变了要连同改这两行; 背面相机接在 eth1 那台路由器上(见 README 2.1)。
+ExecStart=/usr/bin/python3 /data/soph_SN/sn_monitor.py --rtsp rtsp://192.168.1.9:8554/live0 --idle 0 --mi 5 --profile big --rtsp2 rtsp://192.168.1.8:8554/live0
 Restart=always
 RestartSec=5
 # stop 时发 SIGINT -> 干净退出(release 发 TEARDOWN)
