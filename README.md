@@ -53,6 +53,19 @@ sn_monitor_bm1688/
 ```
 > **只有代码进 git**。模型 `*.bmodel`、官方框架 `sophon-demo/`、运行时产物 `logs/`、`sn_results/`、`debug/` 全部 `.gitignore`——它们体积大且环境相关，另按 3.3 部署。
 
+### 3.1b 工作站目录（`/media/sophgo/xiaohao.liu/SN_cratch/`，历史 + 调试脚本）
+本仓库是**唯一代码主副本**；工作站的 `SN_cratch/` 是历史沉淀区，不再作为主副本：
+```
+SN_cratch/
+  sn_monitor.new.py      # 已过时：旧称主副本，现与仓库 sn_monitor.py 内容一致（改代码请改仓库）
+  sncore/                # 历史副本，同源
+  archive/
+    board_versions/      # v8~v17 全部历史版本备份
+    board_legacy/        # 早期探索脚本（sn_barcode / fast / final / inline / tile_scan …）
+  docs/                  # 设计/排障过程文档
+（其余为调试/探活脚本：_gen_*.py 网格生成、keepalive_probe.py / probe_live.py / repro_reconnect.py 等）
+```
+
 ### 3.2 板子运行时目录（`/data/soph_SN/`）
 git 部署后的代码 + 3.3 装好的模型/框架，在板子上合成如下运行时布局：
 ```
@@ -66,7 +79,11 @@ git 部署后的代码 + 3.3 装好的模型/框架，在板子上合成如下�
   debug/                 # 运行时：漏检/待确认留证（原帧+ROI+候选，限 40 组）
 /etc/systemd/system/sn-monitor.service       # ← deploy/sn-monitor.service 拷入（小板）
 /etc/systemd/system/sn-monitor-big.service   # ← deploy/sn-monitor-big.service 拷入（大板；与上互斥，按工位启一个）
+/etc/systemd/system/sn-uploader.service      # ← deploy/sn-uploader.service 拷入（上传 sidecar，见 4.6）
 ```
+
+> ⚠️ **脚本位置有两种布局，两版都在用**：`tools/` 子目录（git 部署，见 3.1）与**扁平**（早期手工 scp，脚本直接在 `/data/soph_SN/` 下）。
+> 因此 `deploy/sn-uploader.service` 的 `ExecStart` 用 shell 探测**两种路径都兼容**，取存在的那个；`sn-monitor*.service` 只依赖 `sn_monitor.py`（本来就在根，两种布局一致）。
 
 ### 3.3 模型 / 框架部署（PP-OCR bmodel + sail，一次性）
 识别依赖官方 PP-OCR 框架与 BM1688 的 `*.bmodel`（**不在 git 里**）。首装步骤（详见 wiki《PP-OCR 搭建及测试》：
@@ -272,13 +289,23 @@ journalctl -u sn-uploader -f           # 看上传实时日志
 ```
 之后放板即「自动识别 → 自动上传 → 前端反映」，全程无需再敲命令。
 
-**只想临时手动上传**（不启用服务时，另开终端）：
+**只想临时手动上传**（不启用服务时，另开终端；脚本在 `tools/` 或扁平位置，按你的部署取其一）：
 ```bash
 sudo python3 /data/soph_SN/tools/sn_uploader.py --url http://10.80.40.57:8099/api/v1/captures --interval 3
+# 扁平部署（早期手工 scp）则是: /data/soph_SN/sn_uploader.py
 ```
 
 > - `.57` 产测后端需在 `:8099` 起着（`cd product_test && ./start.sh`）才能接收入库。
-> - 接口契约 / 参数说明见 `tools/sn_uploader.py` 头部注释；`sn-uploader.service` 单元在 `deploy/`。
+> - 接口契约 / 参数说明见 `tools/sn_uploader.py` 头部注释；`sn-uploader.service` 单元在 `deploy/`（路径兼容 `tools/` 与扁平两种布局）。
+> - ⚠️ **首次启用会"回灌历史"**：uploader 只看 `.uploaded` 标记，不看时间。若 `sn_results/` 里积着大量**从未上传过**的旧命中帧，一 `enable` 就会**全量补传**到 `.57`，把库灌脏。
+>   启用前先确认积压（或按 4.6 的排查：给历史帧批量打 `.uploaded` 标记宣告"不补传"）。
+>   ```bash
+>   # 看有多少未上传的积压(数量非 0 就要先决定补不补)
+>   sudo bash -c 'n=0; for f in /data/soph_SN/sn_results/*.jpg; do [ -f "$f.uploaded" ] || n=$((n+1)); done; echo "未标记: $n"'
+>   # 不想补传: 给当前所有历史帧打标记(此后只传新文件)
+>   sudo bash -c 'for f in /data/soph_SN/sn_results/*.jpg; do [ -f "$f.uploaded" ] || touch "$f.uploaded"; done'
+>   ```
+> - ⚠️ **uploader 不做"内容级"去重**：`.uploaded` 只防**同一文件**重传；同一块板被反复放置产生的多次抓拍（不同文件、业务上重复）**都会入库**，SN 误读（少位/错字）也**照传不误**。清理需在 `.57` 侧按需进行。
 
 ### 4.7 参数扫描工具 `profile_probe.py`（新模组快速定档）
 
@@ -324,6 +351,32 @@ sudo python3 tools/profile_probe.py --jobs-file jobs.txt \
    PROFILES 片段: "crop_w":0.3, "crop_h":0.4, "crop_cy":0.5, "tile_grid":(1,1), "tile_up":2.5, "roi_path":False
 ```
 拿推荐行的 `PROFILES 片段` 抄进 `sn_monitor.py` 的 `PROFILES` 新增一档，再按 3.4 git 部署即可。
+
+### 4.8 v2.1 双路摄像头（正/反两面抓拍）
+
+一个工位加**第二路摄像头**对着板卡**背面**，**只拉流不识别**：在摄像头1识别命中的那一刻**同步抓一帧背面图**，正反两张一并上传、在产测网页端**成对展示**。
+
+**设备能力**：BM1688 有 2 个硬件视频解码核（`/proc/soph/vpuinfo` 的 `vdec_coreid 1/2`），两路 4K HEVC 分到两核上吃得下；背面只在命中瞬间取单帧、不做连续 OCR，负载更低。
+
+**怎么开**：给 `--rtsp` 之外再加一个 `--rtsp2`。空/不加 = 单路（行为完全等同 V2.0.x，现有小/大板零影响）。
+
+| 参数 | 默认 | 说明 |
+|------|------|------|
+| `--rtsp2` | (空) | 第二路（背面）RTSP。空=不开第二路。IP 调通后填 `rtsp://<cam2-ip>:8554/live0` |
+| `--rtsp2-grab-wait` | 0.5 | 命中时从第二路取最新帧的最大阻塞秒（小值防拖慢主识别） |
+
+服务方式：`deploy/sn-monitor.service`（及 big 单元）的 `ExecStart` 末尾追加 `--rtsp2 rtsp://<cam2-ip>:8554/live0` 即可（单元里已留注释占位）。
+
+```bash
+# 手动前台（调试）：
+sudo python3 sn_monitor.py --rtsp rtsp://192.168.1.9:8554/live0 --idle 0 --rtsp2 rtsp://<cam2-ip>:8554/live0
+```
+
+**落盘/上传**：正面仍 `sn_<SN>_<ts>.jpg`+`.json`（JSON 多一个 `"side":"front"`）；背面另存 `sn_<SN>_<ts>_back.jpg`+`_back.json`（`"side":"back"`，`sn/ts/score` 继承正面）。`sn-uploader` 靠 glob `sn_*.jpg` 两张都拾取，POST 带 `side`；正反用**同一 ISO 时刻**上传 → `.57` DB 两行 `captured_at` 一致 → 前端按 `sn+captured_at` 配对成一张卡片并排显示正/反。
+
+**降级与容错**：`--rtsp2` 未配或拉不到流 → 自动降级为单路，背面抓拍跳过，**绝不阻塞/影响正面识别落库**。第二路断线自愈（周期重连）本版未做，命中拿不到背面帧即跳过。
+
+> ⚠️ 第二路同样是**单客户端源**：停/重启服务会断开背面摄像头，需同时重启其推流（与铁律 1 一致）。
 
 ---
 
@@ -410,6 +463,7 @@ ls /data/soph_SN/debug/          # 漏检/待确认留证
 | **V1.6** | 迭代提速 | 模型闲时释放懒加载 + `--poll` 快轮询降延迟 |
 | **V1.7** | 迭代稳定 | **同板去抖**(静板不重识，连带修好模型释放过晚) |
 | **V2.0.1** | ★ 发布版 | **档位系统**(big/small 各向异性裁剪+锚点) + **不切片单帧**(治好 2→7 错读) + 长度门 17。首个对外发布、可 git 部署 |
-| **V2.0.2** | 当前 | 参数扫描工具 `tools/profile_probe.py`(新模组快速定档) + 上传 sidecar `tools/sn_uploader.py` 文档化 + README 发布化(git 部署 / 模型部署 / tools 说明) |
+| **V2.0.2** | 发布后增量 | 参数扫描工具 `tools/profile_probe.py`(新模组快速定档) + 上传 sidecar `tools/sn_uploader.py` 文档化 + README 发布化(git 部署 / 模型部署 / tools 说明) |
+| **V2.1** | ★ 当前 | **双路摄像头**(`--rtsp2` 正面识别命中时同步抓背面一帧,正反配对上传,见 4.8) + `.57` 产测端 `side` 字段与正/反配对展示 + `sn-uploader.service` 修正(路径兼容两种布局、补 `--interval`) |
 
 > 版本号约定：`V0.x` 探索板；`V1.x` 迭代稳定/提速；`V2.0.1` 首个发布版；`V2.0.2` 起为发布后增量更新。

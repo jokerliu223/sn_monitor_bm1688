@@ -43,7 +43,9 @@ def _encode_multipart(fields, jpg_path):
 def upload_one(url, jpg, js, timeout):
     with open(js, "r", encoding="utf-8") as f:
         meta = json.load(f)
-    fields = {"sn": meta.get("sn", ""), "score": str(meta.get("score", 0.0)), "ts": meta.get("ts", "")}
+    # v2.1: side 区分正/反面(front/back); 旧JSON无此字段 -> 默认 front, 向后兼容
+    fields = {"sn": meta.get("sn", ""), "score": str(meta.get("score", 0.0)),
+              "ts": meta.get("ts", ""), "side": meta.get("side", "front")}
     body, content_type = _encode_multipart(fields, jpg)
     req = urllib.request.Request(url, data=body, method="POST")
     req.add_header("Content-Type", content_type)

@@ -11,6 +11,7 @@ User=root
 Environment=PYTHONUNBUFFERED=1
 WorkingDirectory=/data/soph_SN
 # 与 sn-monitor.service 唯一差别: 写死 --profile big(大板裁剪几何/上采样/确认门), 免手改 ExecStart
+# v2.1 第二路(背面)就绪后, 在下行末尾追加: --rtsp2 rtsp://<cam2-ip>:8554/live0  (不加=单路, 零影响)
 ExecStart=/usr/bin/python3 /data/soph_SN/sn_monitor.py --rtsp rtsp://192.168.1.9:8554/live0 --idle 0 --mi 5 --profile big
 Restart=always
 RestartSec=5
