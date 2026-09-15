@@ -1,10 +1,23 @@
 [Unit]
 Description=SN capture uploader (SE9 -> product_test)
 After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/python3 /data/soph_SN/tools/sn_uploader.py --url http://10.80.40.57:8099/api/v1/captures
+User=root
+Environment=PYTHONUNBUFFERED=1
+# 必须 root: .uploaded 标记要写进 sn_results/, 非 root 写不进会重复上传
+WorkingDirectory=/data/soph_SN
+# 脚本位置兼容两种部署:
+#   - git 部署(仓库结构): /data/soph_SN/tools/sn_uploader.py
+#   - 早期扁平手工部署:    /data/soph_SN/sn_uploader.py
+# 用 shell 探测, 取存在的那个, 两者都没有则报错退出(便于 journalctl 看到原因)
+ExecStart=/bin/bash -c 'BIN=/data/soph_SN/tools/sn_uploader.py; \
+  [ -f "$$BIN" ] || BIN=/data/soph_SN/sn_uploader.py; \
+  [ -f "$$BIN" ] || { echo "sn_uploader.py not found (tried tools/ and flat)" >&2; exit 1; }; \
+  exec /usr/bin/python3 "$$BIN" --url http://10.80.40.57:8099/api/v1/captures --interval 3'
+# --interval 3: 常驻必须给轮询间隔, 否则只扫一轮就退出(旧单元缺此项)
 Restart=always
 RestartSec=5
 
