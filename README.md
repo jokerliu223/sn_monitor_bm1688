@@ -1,11 +1,12 @@
 # SN 监控系统 (RTSP → PP-OCR 序列号识别)
 
-SE9 / BM1688 算能板用 eth1 接一台路由器/交换机组成小局域网，从网上拉 RTSP 流，自动侦测板卡铭牌、识别序列号(SN)并落库。当前发布版本 **V2.1**（本仓库为可直接 git 部署的发布版；版本演进见第 7 节）。
+SE9 / BM1688 算能板用 eth1 接一台路由器/交换机组成小局域网，从网上拉 RTSP 流，自动侦测板卡铭牌、识别序列号(SN)并落库。当前发布版本 **V3.0**（本仓库为可直接 git 部署的发布版；版本演进见第 7 节）。
 
 - **单路（默认）**：eth1 上挂一台相机，对着板子正面，识别 SN。
 - **双路（V2.1，加 `--rtsp2`）**：eth1 上再挂第二台相机对着背面，正面识别命中时同步抓一帧背面图，正/反两张一并上传、在产测网页端成对展示。两路是**各拉各的流、不合并**（见 4.8）。
+- **调机预览（V3.0，默认开）**：把已解码的帧硬件编码成 MJPEG，经板子 `:8090` 推给产测网页的「调机预览台」，供人工调镜头。预览**与识别同进程、共享同一路解码**，所以相机源仍然只有 1 条 RTSP 连接，调镜头时识别照常在跑（见 4.10）。
 
-> **V2.1 相对 V2.0.2 的增量**：双路摄像头（`--rtsp2`，正面识别命中时同步抓背面一帧，正/反配对展示，见 4.8）；`.57` 产测端 `side` 字段；`sn-uploader.service` 修正。**单路行为完全不变**——不加 `--rtsp2` 就是 V2.0.2。
+> **V3.0 相对 V2.1 的增量**：内嵌调机预览（`sn_preview_embed.py` + `sn_monitor.py` 6 个 `--preview*` 参数）+ 只读抓拍回显接口 + 旧独立预览服务 `preview_service.py` 停用保留。**识别逻辑逐字节不变**；不想要预览就加 `--no-preview`，行为等同 V2.1。
 
 ---
 
@@ -85,12 +86,15 @@ SE9 / BM1688 算能板用 eth1 接一台路由器/交换机组成小局域网，
 ```
 sn_monitor_bm1688/
   sn_monitor.py          # ★ 唯一入口：RTSP 拉流 + 状态机 + 档位裁剪 + OCR + 投票 + 落库
+  sn_preview_embed.py    # ★ V3.0 调机预览模块：被 sn_monitor.py 内嵌调用，共享同一路解码（见 4.10）
+  preview_service.py     # V1/V2 独立预览服务，已停用保留；接口见 preview_service_README.md
+  preview_service_README.md  # 上面那个脚本自己的 README（停用状态 / 保留接口 / 为什么停）
   sncore/                # SN 处理内核（被 sn_monitor.py import）
     sn_extract.py        #   SN 提取: 多帧投票 + 格式校验 + 掉字子序列合并
     result_gate.py       #   结果二次确认门(ResultGate)
-    sn_line.py           #   SN 行版式辅助
+    sn_line.py           #   SN 行版式辅助（历史遗留，当前无任何 import，可忽略）
     __init__.py
-  tools/                 # 辅助工具（不参与识别主链路，按需运行，见 3.4 与第 4 节）
+  tools/                 # 辅助工具（不参与识别主链路，按需运行，见 3.5 与第 4 节）
     sn_uploader.py       #   命中结果 sidecar：上传 SN+命中帧到 .57 产测系统（见 4.6）
     profile_probe.py     #   参数扫描工具：新模组快速定档（见 4.7）
   deploy/
@@ -116,12 +120,19 @@ SN_cratch/
 ```
 
 ### 3.2 板子运行时目录（`/data/soph_SN/`）
-git 部署后的代码 + 3.3 装好的模型/框架，在板子上合成如下运行时布局：
+部署的代码 + 3.3 装好的模型/框架，在板子上合成如下运行时布局：
+> ⚠️ **板上是扁平部署**：脚本直接放在 `/data/soph_SN/` 根下，**没有 `tools/` 子目录**（`sn_uploader.py` 在根、`profile_probe.py` 未上板）。
+> 3.1 是仓库结构、下面是板上实况，**取路径按实况**——本文档所有命令都按扁平行写。
+
 ```
 /data/soph_SN/
-  sn_monitor.py          # ← git 部署（本仓库根）
-  sncore/                # ← git 部署
-  tools/                 # ← git 部署（sn_uploader.py / profile_probe.py）
+  sn_monitor.py          # ← 部署（本仓库根，手工 scp / git 均可）
+  sn_preview_embed.py    # ← 部署（V3.0 调机预览模块，被 sn_monitor.py 内嵌 import；见 4.10）
+  preview_service.py     # ← 部署（V1/V2 独立预览服务，已停用保留，不进任何 unit）
+  preview_service_README.md  # ← 部署（上面那个脚本的接口说明）
+  sncore/                # ← 部署
+  sn_uploader.py         # ← 部署（仓库在 tools/，板上当前在根；上传 sidecar，见 4.6）
+  deploy/                # ← 部署（三个 systemd 单元，装到 /etc 用；见 4.1）
   sophon-demo/sample/PP-OCR/   # ← 3.3 装：官方框架 + models/BM1688/*.bmodel + datasets 字典
   logs/                  # 运行时：服务日志 sn_monitor.service.log（不进 journalctl）
   sn_results/            # 运行时：识别结果 JSON + sn_list.txt（目录名是 sn_results 不是 results）
@@ -131,8 +142,7 @@ git 部署后的代码 + 3.3 装好的模型/框架，在板子上合成如下�
 /etc/systemd/system/sn-uploader.service      # ← deploy/sn-uploader.service 拷入（上传 sidecar，见 4.6）
 ```
 
-> ⚠️ **脚本位置有两种布局，两版都在用**：`tools/` 子目录（git 部署，见 3.1）与**扁平**（早期手工 scp，脚本直接在 `/data/soph_SN/` 下）。
-> 因此 `deploy/sn-uploader.service` 的 `ExecStart` 用 shell 探测**两种路径都兼容**，取存在的那个；`sn-monitor*.service` 只依赖 `sn_monitor.py`（本来就在根，两种布局一致）。
+> `sn-uploader.service` 的 `ExecStart` 用 shell 探测脚本位置（先试 `tools/sn_uploader.py`，再回落根目录），放哪儿都能起；`sn-monitor*.service` 只依赖根目录的 `sn_monitor.py`。
 
 ### 3.3 模型 / 框架部署（PP-OCR bmodel + sail，一次性）
 识别依赖官方 PP-OCR 框架与 BM1688 的 `*.bmodel`（**不在 git 里**）。首装步骤（详见 wiki《PP-OCR 搭建及测试》：
@@ -183,13 +193,12 @@ sudo systemctl restart sn-monitor                  # 生效（★ 记得同时�
 ```
 > `git pull` 不影响正在跑的进程；生效才需 `restart`。`logs/`、`sn_results/`、`sophon-demo/` 已 `.gitignore`，`git pull` 不会动它们。
 
-### 3.5 `tools/` 辅助工具一览
-两个工具都**不参与识别主链路**，随 git 部署到 `/data/soph_SN/tools/`，按需手动运行。
+### 3.5 两个辅助工具一览（都不参与识别主链路）
 
 | 工具 | 作用 | 使用方式 | 详见 |
 |------|------|----------|------|
 | `sn_uploader.py` | 命中结果 sidecar：监视 `sn_results/`，把 SN+命中帧 HTTP 上传到 .57 产测系统前端/DB。纯 urllib、`.uploaded` 防重传、与识别解耦不影响拉流 | 常驻服务 `sn-uploader`（`deploy/sn-uploader.service`）或前台手动跑 | **4.6** |
-| `profile_probe.py` | 参数扫描器：对「图片+期望SN」笛卡尔积扫裁剪/切块参数，报耗时/命中/候选并推荐档位，新模组快速定档。只读跑 OCR | 前台手动跑，`sudo python3 tools/profile_probe.py ...` | **4.7** |
+| `profile_probe.py` | 参数扫描器：对「图片+期望SN」笛卡尔积扫裁剪/切块参数，报耗时/命中/候选并推荐档位，新模组快速定档。只读跑 OCR | 前台手动跑（见 4.7）；**板上当前没有这个脚本，需先 scp 上板** | **4.7** |
 
 ---
 
@@ -222,7 +231,7 @@ tail -f /data/soph_SN/logs/sn_monitor.service.log
 > **大板工位默认就是双路**：`sn-monitor-big.service` 的 `ExecStart` 里已写死 `--rtsp2 rtsp://192.168.1.8:8554/live0`，**开箱即抓正/反两面，不用手改**。只装一台相机的大板工位，把它删掉即可回到单路。
 > 小板单元 `sn-monitor.service` 是**单路**，要用双路得自己往末尾追加 `--rtsp2 ...`，再 `daemon-reload && restart`。详见 4.8。
 >
-> ⚠️ 这两个单元就是从 `deploy/` 拷进 `/etc/systemd/system/` 的，**部署时覆盖会冲掉本地手改的 IP/参数**，见 4.1 的警告。
+> ⚠️ 这两个单元就是从 `deploy/` 拷进 `/etc/systemd/system/` 的，覆盖会冲掉本地手改——**备份与善后见 4.1**。
 
 #### 用法 B —— 不使用服务，单条手动指令（调试）
 ```bash
@@ -240,7 +249,7 @@ sudo python3 sn_monitor.py --rtsp rtsp://192.168.1.9:8554/live0 --idle 0 --profi
 #   （双路时两台相机都要重启）
 
 # 如需上传到前端/DB（可选，另开一个终端；不上传就不用起）：
-sudo python3 /data/soph_SN/tools/sn_uploader.py --url http://10.80.40.57:8099/api/v1/captures --interval 3
+sudo python3 /data/soph_SN/sn_uploader.py --url http://10.80.40.57:8099/api/v1/captures --interval 3
 ```
 > 大板/小板唯一区别就是 `--profile`（一次切换裁剪几何/上采样/确认门，见 4.3）。
 > 结果落在 `/data/soph_SN/sn_results/`（`sn_<SN>_<ts>.json` + 命中帧 `.jpg`）。
@@ -361,14 +370,13 @@ journalctl -u sn-uploader -f           # 看上传实时日志
 ```
 之后放板即「自动识别 → 自动上传 → 前端反映」，全程无需再敲命令。
 
-**只想临时手动上传**（不启用服务时，另开终端；脚本在 `tools/` 或扁平位置，按你的部署取其一）：
+**只想临时手动上传**（不启用服务时，另开终端）：
 ```bash
-sudo python3 /data/soph_SN/tools/sn_uploader.py --url http://10.80.40.57:8099/api/v1/captures --interval 3
-# 扁平部署（早期手工 scp）则是: /data/soph_SN/sn_uploader.py
+sudo python3 /data/soph_SN/sn_uploader.py --url http://10.80.40.57:8099/api/v1/captures --interval 3
 ```
 
 > - `.57` 产测后端需在 `:8099` 起着（`cd product_test && ./start.sh`）才能接收入库。
-> - 接口契约 / 参数说明见 `tools/sn_uploader.py` 头部注释；`sn-uploader.service` 单元在 `deploy/`（路径兼容 `tools/` 与扁平两种布局）。
+> - 接口契约 / 参数说明见 `sn_uploader.py` 头部注释；`sn-uploader.service` 单元在板上 `deploy/`。
 > - ⚠️ **首次启用会"回灌历史"**：uploader 只看 `.uploaded` 标记，不看时间。若 `sn_results/` 里积着大量**从未上传过**的旧命中帧，一 `enable` 就会**全量补传**到 `.57`，把库灌脏。
 >   启用前先确认积压（或按 4.6 的排查：给历史帧批量打 `.uploaded` 标记宣告"不补传"）。
 >   ```bash
@@ -377,25 +385,28 @@ sudo python3 /data/soph_SN/tools/sn_uploader.py --url http://10.80.40.57:8099/ap
 >   # 不想补传: 给当前所有历史帧打标记(此后只传新文件)
 >   sudo bash -c 'for f in /data/soph_SN/sn_results/*.jpg; do [ -f "$f.uploaded" ] || touch "$f.uploaded"; done'
 >   ```
-> - ⚠️ **uploader 的去重是"文件级"，不是"内容级"，也不比数据库**——这是最常被问的一点，明确写死：
->   - 判据**只有一个**：同名 `.uploaded` 标记文件是否存在（`tools/sn_uploader.py` 的 `iter_pending()` 里就一个 `os.path.exists(base+".uploaded")`）。
+> - ⚠️ **uploader 的去重是"文件级"，不是"内容级"，也不比数据库**——最常被问的一点，写死在这里，别处不再重复：
+>   - 判据**只有一个**：同名 `.uploaded` 标记文件是否存在（`sn_uploader.py` 的 `iter_pending()` 里就一个 `os.path.exists(base+".uploaded")`）。
 >   - **不与 `.57` 数据库比对**：uploader 里没有 DB 连接、不装 sqlalchemy、不发任何查询，连"远端已有哪些 SN"都不知道。
 >   - **不在单次扫描内去重**：同一轮里若两个文件内容相同（不同文件名），两张都传。
 >   - 后果：**同一块板反复放置**产生的多次抓拍是**不同文件名**，`.uploaded` 拦不住 → 全部入库（业务级重复）；**SN 误读**（少位/错字）同样**照传不误**。
 >   - 换句话说：它保证的是"每个本地文件最多成功上传一次"，**不保证"每块板在远端只出现一次"**。清理只能在 `.57` 侧按需做。
->   - 可选的上游加固（尚未实现）：给 uploader 加一道 **SN 格式闸**，拦掉明显错读的 SN，避免脏数据进库。
+>   - **SN 错读不靠 uploader 拦，靠扫描端的格式闸**（已实现，见 4.5）：SN 在 OCR 之后先过 `SNConfig`（`--sn-min-len` / `--sn-max-len` / `--sn-prefix` + 字符集与合并规则），不合格的**在识别进程内就被丢掉**，根本走不到落盘，也就不会产生待传文件。所以 uploader 侧不需要再加一道格式闸——那只会把已经校验过的字符串再验一遍。
 
 ### 4.7 参数扫描工具 `profile_probe.py`（新模组快速定档）
 
 每上一款**新模组/新板型**，SN 铭牌的位置与占比都变，档位参数（各向异性裁剪 `crop_w/crop_h/crop_cy` + 切块 `tile_grid/tile_up` + ROI 路）得重调。`profile_probe.py` 把这些参数**笛卡尔积扫一遍**，对「图片+期望SN」逐组合报 **耗时 / SN是否命中(带score) / 候选数**，末尾直接给「命中且最快」的推荐组合，可抄进 `PROFILES` 定新档。**只读**：仅跑 OCR，不落库、不上传、不碰在跑的服务。
 
-> 需在**板子上跑**（要 sail 加载 OCR bmodel）。随本仓库 git 部署（`tools/profile_probe.py`），无需单独 scp。
+> 需在**板子上跑**（要 sail 加载 OCR bmodel）。脚本在仓库的 `tools/` 下，但**板上当前没有这个文件**（未随部署上板），用前先 scp 到板子根目录：
+> ```bash
+> scp tools/profile_probe.py linaro@<板子IP>:/data/soph_SN/     # 与 sn_uploader.py 同放根，保持扁平
+> ```
 
 **文件路径**：
 | 项 | 路径 |
 |----|------|
 | 脚本（仓库内） | `tools/profile_probe.py` |
-| 运行位置（板子，git 部署后） | `/data/soph_SN/tools/profile_probe.py` |
+| 运行位置（板子，手动 scp 后） | `/data/soph_SN/profile_probe.py` |
 | 裁剪图输出目录（默认） | `./profile_probe_out/`（在板子即当前工作目录下），文件名用 **宽/高/锚点** 组合：`<图名>_cw0.30_ch0.40_cy0.50.jpg`，供人眼核对每种裁剪框住了哪块。可用 `--out-dir` 改 |
 
 **使用方式**：
@@ -405,13 +416,13 @@ sudo systemctl stop sn-monitor
 cd /data/soph_SN
 
 # ① 默认:扫 sn_results/ 下历史命中帧(期望SN从文件名反解), 跑内置常用网格
-sudo python3 tools/profile_probe.py
+sudo python3 profile_probe.py
 
 # ② 指定新模组测试图 + 期望SN(最常用)
-sudo python3 tools/profile_probe.py --jobs "/tmp/newmod_a.jpg:BCXX...,/tmp/newmod_b.jpg:BCYY..."
+sudo python3 profile_probe.py --jobs "/tmp/newmod_a.jpg:BCXX...,/tmp/newmod_b.jpg:BCYY..."
 
 # ③ 自定义扫描网格(收窄范围, 加快)
-sudo python3 tools/profile_probe.py --jobs-file jobs.txt \
+sudo python3 profile_probe.py --jobs-file jobs.txt \
     --crop-w 0.3,0.4,1.0 --crop-h 0.35,0.4 --crop-cy 0.32,0.5 \
     --tile 1x1,2x2 --up 2.0,2.5,3.0 --roi off --rots 0
 ```
@@ -501,13 +512,9 @@ sudo python3 sn_monitor.py --rtsp rtsp://192.168.1.9:8554/live0 \
 ```
 若第二路不通，会打印 `⚠ 第二路 ... 暂不可达, 本次降级为单路(仅正面), 背面抓拍跳过` 然后照常单路运行——**这是刻意设计：不阻塞重试、直接降级**，等相机调通再重启服务即可。
 
-> 手动前台跑**只管识别**，不管上传。要上传得**另开一个终端**跑 uploader（长驻，`Ctrl-C` 停）：
-> ```bash
-> sudo python3 tools/sn_uploader.py --url http://10.80.40.57:8099/api/v1/captures --interval 3
-> ```
-> **生产环境不用这么麻烦**：`sn-uploader.service` 已 enable，开机随 `sn-monitor*` 一起常驻，两个服务各占一个后台进程、互不干扰——只有"手动前台调试"这种非服务方式，才需要自己多开一个窗口。双路也不额外增加终端：一张正面图 + 一张背面图由同一个 uploader 一起拾取上传。
+> 手动前台跑**只管识别**，不管上传；上传方式（手动 / 常驻服务）见 4.0 用法 B 与 4.6。
 
-> **注意**：第二路**不做**断线自愈（周期重连）。跑起来之后若背面相机掉线，本进程不会自动接回来，需重启服务。正面那一路的自愈机制不受影响。
+> **注意**：第二路**不做**断线自愈（周期重连）。跑起来之后若背面相机掉线，本进程不会自动接回来，需重启服务；重启时别忘了背面推流（铁律 1）。正面那一路的自愈机制不受影响。
 
 #### 落盘 / 配对 / 上传
 
@@ -534,6 +541,88 @@ sudo python3 sn_monitor.py --rtsp rtsp://192.168.1.9:8554/live0 \
 - 落盘文件名同步改了：`data/sn_captures/<SN>/<时间戳>_<side>.jpg`（带 `side` 后缀，否则同一命中正反同秒会互相覆盖）。
 - 页面上时间显示的是**抓拍时间 `captured_at`**（缺失才回退入库时间 `uploaded_at`）；但**筛选框按入库时间 `uploaded_at` 过滤**——这是刻意的（入库时间永不为空、且不受板子时钟漂移影响），所以筛选出来的日期范围可能和卡片上显示的时间差一两天，属正常现象。
 - **`.57` 端实现细节见该仓库自己的 `README.md`「SN 抓拍」章节**，不在本仓库维护。
+
+---
+
+### 4.10 V3.0 调机预览（与识别同进程，双路）
+
+**作用**：产测网页的「调机预览台」页面上实时看两路摄像头画面，供人工调镜头高度/焦距。
+V3.0 起预览**内嵌在 `sn_monitor.py` 里**，与识别共享同一路解码 —— 调镜头时识别照常在跑，
+不用像 V1/V2 那样"停预览↔起识别"来回切。
+
+**为什么必须内嵌**：相机是**单客户端源**（铁律 1），第二路 RTSP 连接会把已有的踢掉。
+所以预览不能自己再连一次，只能用识别进程已经解码好的帧（`sn_preview_embed.py` 里的
+`_peek` 非阻塞取最新帧 → Bmcv 硬件编 JPEG → MJPEG 推给网页）。
+
+#### 启停
+
+预览**没有独立服务**了，跟着识别服务一起启停：
+
+```bash
+sudo systemctl restart sn-monitor-big     # 起识别 = 同时起了预览
+sudo systemctl stop    sn-monitor-big     # 停识别 = 同时停预览
+```
+
+板子上 `:8090` 起来后，日志里会打印一行：
+
+```
+  📺 预览已启动: http://<板子IP>:8090  (front+back, 4k, 8.0fps 上限)
+     识别与预览共享同一路解码，相机源仍只有 1 条 RTSP 连接
+```
+
+#### 相关参数（`sn_monitor.py` 命令行）
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `--no-preview` | 关（即默认开预览） | **一键回退到 V2 行为**：完全不启预览，识别逻辑逐字节等同 |
+| `--preview-port` | `8090` | Flask 端口 |
+| `--preview-fps` | `8.0` | 编码**上限**（不是保证值）。识别不受此值影响 |
+| `--preview-res` | `4k` | `4k`/`1080p`/`720p`/`360p`，`4k`=不缩放。网页上也能实时切 |
+| `--preview-cam` | `both` | `both`/`front`/`back`，只预览哪几路 |
+| `--preview-jpeg-quality` | `80` | **仅记录**，当前 Bmcv 编码质量不可调，改这个值不生效 |
+
+#### 实测数据（2026-09-16，双路同时 4K）
+
+| 指标 | 数值 |
+|---|---|
+| 单路 4K 编码 | 94 ms/帧 |
+| **双路同时 4K** | **~175 ms/帧**（两路各一个线程，互不排队） |
+| 双路帧率达成 | 8 fps 上限跑满，`skipped` 少量 |
+| 进程 CPU | ~380%（≈4 核），系统剩 ~37% idle |
+| 相机连接数 | 正/背各 **1** 条（REQ-103 达成） |
+
+> **画面卡顿时先降分辨率**：网页工具栏切 `1080p`，编码耗时和码率都显著下降，
+> 而**识别用的图完全不受影响**（识别走原始 4K 帧，与预览分辨率无关）。
+
+#### 抓拍回显（只读，不入库）
+
+页面底部的横条会显示板子上**最近一张已配对**的抓拍图 + SN，可点击放大。
+它读的是 `sn_results/` 里 `sn_<SN>_<ts>.jpg`（**要求同名 `.json` 已存在**，避免读到写一半的图），
+按 mtime 取最新，**只读不写数据库**。
+
+因此：回显看到的是"板子刚存下的"，而产测页「SN 抓拍」看到的是"uploader 上传后的"，
+两者差约 5 秒（uploader 的 watch 周期），偶有不同步属正常。
+回显**不会**往 `sn_captures` 表写入任何行。
+
+#### 回退路径
+
+预览整块是**纯加法**。出问题按以下顺序退：
+
+1. 网页上切低分辨率（最轻，`1080p` 通常就够）
+2. 重启服务时加 `--no-preview`（行为等同 V2，识别不受任何影响）
+3. 彻底移除：删除 `sn_preview_embed.py`，并撤掉 `sn_monitor.py` 里 4 处预览相关小改动
+   （import 兜底、6 个 CLI 参数、`attach()` 调用、`finally` 里的 `preview_stop()`）
+
+预览线程**吞掉所有异常**（铁律 2），且 `attach()` 外层还有 try/except ——
+预览起不来只会打一行警告，识别照常。
+
+> Flask 在 `sn_preview_embed.py` 里是**懒导入**：模块的纯逻辑（抓拍图挑选 / 档位表）在没有 Flask 的环境也能 import 和单测；
+> 缺 Flask 时只打印「预览不可用」，`sn_monitor.py` 的 import 兜底会接住，识别照常跑。
+
+#### V1/V2 的独立预览服务
+
+`preview_service.py` 是旧的独立预览服务，**已停用（`stop` + `disable`）但保留未删**，
+脚本和它的接口说明见**同目录 `preview_service_README.md`**。
 
 ---
 
@@ -628,7 +717,7 @@ vote 出的 SN 不立即落库：需连续 `--confirm` 次同一 SN，或单次�
 | **双路：背面图不变/是旧画面** | 相机2 推流是否真在动？背面靠 `reader2` 排空缓冲取最新帧，源停推就会一直是同一帧。另注意背面**无断线自愈**，掉线需重启服务 |
 | **双路：卡片只显示正面** | ① 上传是否带 `side`？（板子 `sn_results/*_back.json` 里应有 `"side":"back"`）② `.57` 库里那两行 `captured_at` 是否真的一致？（差一点点就配不上对）③ 老库是否忘了 `ALTER TABLE ... ADD COLUMN side`？见 4.9 |
 | **网页上时间与筛选日期差一两天** | 正常：卡片显示**抓拍时间**，筛选按**入库时间**。见 4.9 |
-| **上传器灌了一堆重复** | uploader 只按 `.uploaded` 标记做**文件级**去重，不管内容/业务重复、也不比 DB。首次启用前的历史积压会全量补传（见 4.6）。清理需在 `.57` 侧做 |
+| **上传器灌了一堆重复** | 预期行为：uploader 只做**文件级**去重，不管内容/业务重复。原因、积压补传与善后全在 **4.6**；清库在 `.57` 侧做 |
 
 日志与结果：
 ```
@@ -650,6 +739,7 @@ ls /data/soph_SN/debug/          # 漏检/待确认留证
 | **V1.7** | 迭代稳定 | **同板去抖**(静板不重识，连带修好模型释放过晚) |
 | **V2.0.1** | ★ 发布版 | **档位系统**(big/small 各向异性裁剪+锚点) + **不切片单帧**(治好 2→7 错读) + 长度门 17。首个对外发布、可 git 部署 |
 | **V2.0.2** | 发布后增量 | 参数扫描工具 `tools/profile_probe.py`(新模组快速定档) + 上传 sidecar `tools/sn_uploader.py` 文档化 + README 发布化(git 部署 / 模型部署 / tools 说明) |
-| **V2.1** | ★ 当前 | **双路摄像头**(`--rtsp2` 正面识别命中时同步抓背面一帧,正反配对上传,见 4.8) + `.57` 产测端 `side` 字段与正/反配对展示 + `sn-uploader.service` 修正(路径兼容两种布局、补 `--interval`) + **`sn-monitor-big.service` 内置双路**(大板工位开箱即双路,不再需要手改 ExecStart) |
+| **V2.1** | 上一版 | **双路摄像头**(`--rtsp2` 正面识别命中时同步抓背面一帧,正反配对上传,见 4.8) + `.57` 产测端 `side` 字段与正/反配对展示 + `sn-uploader.service` 修正(路径兼容两种布局、补 `--interval`) + **`sn-monitor-big.service` 内置双路**(大板工位开箱即双路,不再需要手改 ExecStart) |
+| **V3.0** | ★ 当前 | **调机预览内嵌**(`sn_preview_embed.py`)：预览并入 `sn_monitor.py`，与识别**共享同一路解码**(相机仍只有 1 条连接)，调镜头时识别照常跑，不再需要停预览↔起识别来回切。新增 6 个 `--preview*` 参数(含 `--no-preview` 一键回退) + 只读抓拍回显接口 + `.57` 底部抓拍横条；旧独立预览服务 `preview_service.py` 停用保留(见 4.10) |
 
-> 版本号约定：`V0.x` 探索板；`V1.x` 迭代稳定/提速；`V2.0.1` 首个发布版；`V2.0.2` 起为发布后增量更新。
+> 版本号约定：`V0.x` 探索板；`V1.x` 迭代稳定/提速；`V2.0.1` 首个发布版；`V2.0.2` 起为发布后增量更新；`V3.0` 起预览/识别同进程。
