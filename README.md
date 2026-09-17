@@ -6,8 +6,7 @@ SE9 / BM1688 算能板用 eth1 接一台路由器/交换机组成小局域网，
 
 - **单路识别（默认）**：eth1 上挂一台相机对着板子正面，识别 SN。
 - **双路（V2.1，加 `--rtsp2`）**：再挂第二台相机对着背面，正面识别命中时同步抓一帧背面图，正/反两张一并上传、在产测网页成对展示。两路**各拉各的流、不合并**。
-- **调机预览（V3.0，默认开）**：把已解码的帧硬件编码成 MJPEG，经板子 `:8090` 推给产测网页的「调机预览台」，供人工调镜头。预览**与识别同进程、共享同一路解码**，相机源仍只有 1 条 RTSP 连接。
-
+- **调机预览（V3.0，默认开）**：把已解码的帧硬件编码成 MJPEG，经板子 `:8090` 推给产测网页的「调机预览台」，供人工调镜头。预览**与识别同进程、共享同一路解码**，相机源仍只有 1 条 RTSP 连接。（`:8090` 在**板子**上；产测网页在 **`.57` 的 `:8099`**，由 `.57` 中继转发，浏览器不直连板子 —— 见 6.1）
 > **V3.0 相对 V2.1 的增量**：内嵌调机预览（`sn_preview_embed.py` + `sn_monitor.py` 的 6 个 `--preview*` 参数）+ 只读抓拍回显接口 + 旧独立预览服务 `preview_service.py` 停用保留。
 > **识别逻辑逐字节不变**；不想要预览就加 `--no-preview`，行为等同 V2.1。
 >
@@ -89,9 +88,10 @@ SE9 / BM1688 算能板用 eth1 接一台路由器/交换机组成小局域网，
 
 ## 3. 部署
 
-### 3.1 ★ 两个服务的关系（最容易搞混，先看这张图）
+### 3.1 ★ 两个服务的关系（V3.0.1 起启动时自动拉起）
 
-板上**实际在跑两个各自独立的进程**，谁也不拉起谁：
+板上**实际跑两个独立进程**（各自独立的 systemd 单元，谁都不 spawn 谁），
+但 **V3.0.1 起 `start` monitor 时 uploader 自动跟随**——只需敲一条命令：
 
 ```
         ┌──────────────────────────────────────────────┐
@@ -100,25 +100,27 @@ SE9 / BM1688 算能板用 eth1 接一台路由器/交换机组成小局域网，
         │                                              │
         │  内含：① 拉流 + 侦测 + OCR + 投票 + 落库      │
         │        ② 调机预览（V3.0 起并入本进程，:8090） │
+        │                                              │
+        │  Wants=sn-uploader.service  ──────► start 时自动拉起
         └──────────────────────┬───────────────────────┘
                                │ 写 sn_results/*.json + *.jpg
                                ▼
         ┌──────────────────────────────────────────────┐
-        │  sn-uploader.service                         │   ← 上传 sidecar（可选，独立进程）
+        │  sn-uploader.service                         │   ← 上传 sidecar
         │  sn_uploader.py --url ... --interval 3       │
         │  监视 sn_results/，把结果 POST 到 .57         │
+        │  PartOf=  ← stop/restart monitor 时同步跟随   │
         └──────────────────────────────────────────────┘
 
         sn-preview.service  ✗ 已停用，deploy/ 里故意不放这个单元
-        （旧 V1/V2 独立预览服务，会和识别抢摄像头，见 docs/features/preview-v3.md）
 ```
-
-要回答三个常见疑问：
 
 | 疑问 | 答案 |
 |------|------|
-| uploader 是包含在 `sn-monitor` 里面的吗？ | **不是**。`sn_monitor.py` 里没有 `subprocess` / `Popen` / `fork`，两个是**各自独立的 systemd 单元**，谁都不拉起谁。 |
-| 那要启用几个服务？ | **两个都要各 `enable` 一次**（识别一个 + 上传一个）。不装上传就只启用识别，也能正常识别落盘。 |
+| uploader 是包含在 `sn-monitor` 里面吗？ | **不是**（进程独立），但 **V3.0.1 起 `start` monitor 时自动拉起**——靠 systemd 的 `Wants=` + `PartOf=`，不是靠代码 spawn。 |
+| 要手动启用几个服务？ | **一条命令** `systemctl enable --now sn-monitor-big`（或 `sn-monitor`）即可——`WantedBy=` 让 uploader 同时 enable。 |
+| uploader 崩了会影响识别吗？ | **不会**。`Wants=`（不是 `Requires=`），uploader 起不来或中途挂掉只记日志，识别照常。uploader 自身 `Restart=always` 会自动重试。 |
+| 我想暂时关掉上传但不影响识别？ | `sudo systemctl stop sn-uploader` 单独停 uploader；恢复 `start` 即可，不用动 monitor。永久关：`sudo systemctl mask sn-uploader`。 |
 | 调机预览要不要单独起服务？ | **不用**。V3.0 起预览已经并进识别进程，`restart` 识别服务即同时起/停预览。 |
 
 ### 3.2 代码部署（板子上没有 git 仓库，走 scp）
@@ -244,27 +246,31 @@ python3 ppocr_system_opencv.py \
 
 ## 4. 使用
 
-### 4.1 ★ 三步跑起来
+### 4.1 ★ 两步跑起来（V3.0.1 起 uploader 自动跟随）
 
 **先决**：板子 SSH `linaro@10.80.40.53`；摄像头 `rtsp://192.168.1.9:8554/live0`；工作目录 `/data/soph_SN`。
 
 ```bash
-# ① 装单元 + 启用识别（一个工位固定一种板子，二选一）
-sudo cp /data/soph_SN/deploy/sn-monitor.service /data/soph_SN/deploy/sn-monitor-big.service /etc/systemd/system/
+# ① 装单元（首次部署；三个可以一次全拷，启用谁看工位）
+sudo cp /data/soph_SN/deploy/sn-monitor.service \
+        /data/soph_SN/deploy/sn-monitor-big.service \
+        /data/soph_SN/deploy/sn-uploader.service /etc/systemd/system/
 sudo systemctl daemon-reload
+
+# ② 一条命令启用（识别+预览+上传全部拉起）
 sudo systemctl enable --now sn-monitor-big      # 大板。小板工位改用 sn-monitor
 
-# ② 启用上传 sidecar（可选；不装就只本地落盘）
-sudo systemctl enable --now sn-uploader
-
-# ③ 之后放板即自动「识别 → 落盘 → 上传」，无需再敲任何命令。看实时日志：
+# 之后放板即自动「识别 → 落盘 → 上传」，无需再敲任何命令。看实时日志：
 tail -f /data/soph_SN/logs/sn_monitor.service.log
+journalctl -u sn-uploader -f                    # 上传日志（独立）
 ```
 
 > 换板型：`sudo systemctl disable --now sn-monitor && sudo systemctl enable --now sn-monitor-big`（反之亦然）。
 > 两个单元互斥（`Conflicts=`），enable 其一会自动停另一个。
 > **大板工位默认就是双路**（`--rtsp2` 已写死在单元里）；只装一台相机的大板工位，把那行末尾的 `--rtsp2 ...` 删掉即回到单路。
 > **小板单元是单路**，要双路得自己往末尾追加 `--rtsp2 ...`，再 `daemon-reload && restart`。详见 [docs/features/dual-camera.md](docs/features/dual-camera.md)。
+>
+> **临时关上传**：`sudo systemctl stop sn-uploader`（不影响识别）。永久关：`sudo systemctl mask sn-uploader`。
 
 ### 4.2 常用运维命令
 
@@ -439,8 +445,19 @@ RTSP-cam2(背面) ─► FrameReader2 ─► 只排空缓冲, 无 OCR           
 **不新增任何 RTSP 连接**：
 
 ```
-FrameReader1/2 ─ 已解码帧 ─► _peek(非阻塞, 拿不到就跳过) ─► Bmcv 编 JPEG ─► MJPEG ─► 网页 :8090
+【板子 10.80.40.53】                        【.57 10.80.40.57】        【浏览器】
+FrameReader1/2 ─ 已解码帧
+   └► _peek(非阻塞, 拿不到就跳过)
+       └► Bmcv 编 JPEG ─► :8090 ──同源中继──► 8099 ─────────────────► 网页
+                          (板子)   /api/v1/camera/*  (产测后端)       <img src=...>
 ```
+
+> ⚠️ **`:8090` 和 `:8099` 不是同一个服务，也不在同一台机器上**：
+> `:8090` 是**板子**上的预览服务（V3.0 起内嵌在 `sn_monitor.py` 里，随识别服务启停）；
+> `:8099` 是 **`.57`** 上的产测系统后端（FastAPI/uvicorn）。
+> **浏览器只跟 `.57` 的 `:8099` 说话**，它自己不直连板子 —— 由 `.57` 的 `/api/v1/camera/*` 接口做一次中继转发。
+> 为什么绕这一跳：浏览器直连板子要开跨域，而且板子网段对办公网不直接暴露，每换一台调机电脑都得改配置；中继后换电脑零配置。
+> 板子地址写在 `.57` 的 `backend/api/camera.py` 里（`BOARD_BASE = http://10.80.40.53:8090`，可用环境变量 `PREVIEW_BOARD_BASE` 覆盖）。
 
 ### 6.2 关键设计决策（每条都对应踩过的坑）
 

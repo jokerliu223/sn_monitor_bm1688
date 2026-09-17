@@ -35,7 +35,21 @@
 
 ## 逐版说明
 
-### V3.0 —— 调机预览内嵌（当前）
+### V3.0.1 —— 服务合并（一条命令启动全部）【最新】
+
+**改动**：deploy/ 三个 systemd 单元各加 1–2 行（`Wants=` + `PartOf=` + `WantedBy=`），
+实现 `systemctl enable --now sn-monitor-big` 一条命令同时拉起识别+预览+上传。
+代码零改动。
+
+| 操作 | 效果 |
+|------|------|
+| `systemctl start sn-monitor-big` | 自动 start uploader（`Wants=`） |
+| `systemctl stop sn-monitor-big` | 同步 stop uploader（`PartOf=`） |
+| `systemctl enable sn-monitor-big` | 自动 enable uploader（`WantedBy=`） |
+| uploader 自身 crash | 独立重试（`Restart=always`），不影响识别 |
+| `systemctl stop sn-uploader`（单独） | monitor 不受影响（含临时关上传） |
+
+### V3.0 —— 调机预览内嵌
 
 **解决的问题**：V1/V2 的预览是**独立服务** `preview_service.py`，它要自己拉一路 RTSP。而相机是**单客户端源**，第二路连接会把识别那路踢掉 —— 于是"调镜头"和"跑识别"只能二选一，来回 `systemctl stop/start`。
 

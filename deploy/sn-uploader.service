@@ -2,6 +2,8 @@
 Description=SN capture uploader (SE9 -> product_test)
 After=network-online.target
 Wants=network-online.target
+# ★ V3.0.1: 绑到 monitor 单元上 —— start/stop/enable monitor 时自动跟随，不用单独敲
+PartOf=sn-monitor.service sn-monitor-big.service
 
 [Service]
 Type=simple
@@ -22,4 +24,5 @@ Restart=always
 RestartSec=5
 
 [Install]
-WantedBy=multi-user.target
+# enable monitor 时自动 enable 本单元（仍可单独 enable / disable）
+WantedBy=sn-monitor.service sn-monitor-big.service multi-user.target
