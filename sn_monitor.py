@@ -24,6 +24,14 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from sncore.sn_extract import vote, SNConfig
 from sncore.result_gate import ResultGate
 
+# V3.0 调机预览(可选): 与识别同进程, 共享同一路解码 -> 相机源仍只占用一次。
+# 纯加法, 挂不上就返回 None, 识别行为完全不变(等同 V2)。
+try:
+    import sn_preview_embed
+except Exception as _e:   # Flask 缺失等: 预览失效但不影响识别
+    sn_preview_embed = None
+    print(f"  ⚠ 预览模块不可用({type(_e).__name__}: {_e}), 仅识别")
+
 PP_OCR_DIR = "/data/soph_SN/sophon-demo/sample/PP-OCR/python"
 DET_MODEL = "../models/BM1688/ch_PP-OCRv4_det_int8_2core.bmodel"
 REC_MODEL = "../models/BM1688/ch_PP-OCRv4_rec_int8_2core.bmodel"
@@ -533,6 +541,18 @@ def main():
                    help="关闭漏检/待确认留证(存原帧+ROI+候选到 debug/)")
     p.add_argument("--miss-keep", type=int, default=40, dest="miss_keep",
                    help="留证目录最多保留组数(超出删最旧)")
+    # V3.0 调机预览(可选, 全带默认值 -> 不给也照常跑纯识别)
+    p.add_argument("--no-preview", action="store_false", dest="preview",
+                   help="关闭内嵌预览(退回 V2 纯识别行为; 预览出问题时的干净回退开关)")
+    p.add_argument("--preview-port", type=int, default=8090, dest="preview_port")
+    p.add_argument("--preview-fps", type=float, default=8.0, dest="preview_fps",
+                   help="预览编码上限帧率(节流阈值, 不追满解码帧率; 8 远低于实测上限, 给识别留足余量)")
+    p.add_argument("--preview-res", choices=["4k", "1080p", "720p", "360p"], default="4k",
+                   dest="preview_res", help="预览默认档位; 只影响预览副本的缩放, 识别图恒为全幅")
+    p.add_argument("--preview-cam", choices=["both", "front", "back"], default="both",
+                   dest="preview_cam", help="预览哪几路(背面/第二路仅拉流不识别)")
+    p.add_argument("--preview-jpeg-quality", type=int, default=80, dest="preview_jpeg_quality",
+                   help="记录用(Bmcv 实测不可调); 留档便于换编码器时对齐")
     args = p.parse_args()
     # profile: 一档参数打包; 用户显式CLI标志仍覆盖profile
     PROFILES = {
@@ -603,6 +623,16 @@ def main():
             print(f"  ⚠ 第二路 {args.rtsp2} 暂不可达, 本次降级为单路(仅正面), 背面抓拍跳过")
 
     print("\n[监控启动]\n")
+
+    # V3.0: 预览挂在**已存在**的 FrameReader 上, 不新建连接 -> 相机源仍只有 1 条 RTSP。
+    # 位置在 try 之外: 即使预览起不来, 也不会掩盖下面识别主循环的异常处理。
+    preview_stop = lambda: None
+    if args.preview and sn_preview_embed is not None:
+        _pv_cam = {"both": (True, True), "front": (True, False), "back": (False, True)}[args.preview_cam]
+        _, preview_stop = sn_preview_embed.attach(
+            reader, reader2, RESULTS_DIR,
+            port=args.preview_port, fps=args.preview_fps, res=args.preview_res,
+            preview=_pv_cam, jpeg_quality=args.preview_jpeg_quality)
 
     try:
         while not STOP:
@@ -797,6 +827,7 @@ def main():
             reader2.set_cap(None)
             reader2.wait_released(3.0)
             reader2.run = False
+        preview_stop()            # V3.0: 停预览编码线程(daemon, 这里等它退出, 不留僵尸)
         print(f"统计: 监控{mon}次 SN{sn_cnt}个")
 
 if __name__ == "__main__":
