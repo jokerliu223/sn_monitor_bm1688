@@ -101,7 +101,8 @@ SE9 / BM1688 算能板用 eth1 接一台路由器/交换机组成小局域网，
         │  内含：① 拉流 + 侦测 + OCR + 投票 + 落库      │
         │        ② 调机预览（V3.0 起并入本进程，:8090） │
         │                                              │
-        │  Wants=sn-uploader.service  ──────► start 时自动拉起
+        │  ExecStartPre=start uploader  ──► start 时自动拉起
+        │  ExecStopPost= stop  uploader  ──► stop/restart 时自动跟随
         └──────────────────────┬───────────────────────┘
                                │ 写 sn_results/*.json + *.jpg
                                ▼
@@ -109,7 +110,6 @@ SE9 / BM1688 算能板用 eth1 接一台路由器/交换机组成小局域网，
         │  sn-uploader.service                         │   ← 上传 sidecar
         │  sn_uploader.py --url ... --interval 3       │
         │  监视 sn_results/，把结果 POST 到 .57         │
-        │  PartOf=  ← stop/restart monitor 时同步跟随   │
         └──────────────────────────────────────────────┘
 
         sn-preview.service  ✗ 已停用，deploy/ 里故意不放这个单元
@@ -117,9 +117,10 @@ SE9 / BM1688 算能板用 eth1 接一台路由器/交换机组成小局域网，
 
 | 疑问 | 答案 |
 |------|------|
-| uploader 是包含在 `sn-monitor` 里面吗？ | **不是**（进程独立），但 **V3.0.1 起 `start` monitor 时自动拉起**——靠 systemd 的 `Wants=` + `PartOf=`，不是靠代码 spawn。 |
+| uploader 是包含在 `sn-monitor` 里面吗？ | **不是**（进程独立），但 **V3.0.1 起 monitor 的 `ExecStartPre`/`ExecStopPost` 自动管理 uploader 启停**——不靠代码 spawn，靠 systemd 指令。 |
 | 要手动启用几个服务？ | **一条命令** `systemctl enable --now sn-monitor-big`（或 `sn-monitor`）即可——`WantedBy=` 让 uploader 同时 enable。 |
-| uploader 崩了会影响识别吗？ | **不会**。`Wants=`（不是 `Requires=`），uploader 起不来或中途挂掉只记日志，识别照常。uploader 自身 `Restart=always` 会自动重试。 |
+| restart monitor 会冲突吗？ | **不会**。用 `ExecStartPre`/`ExecStopPost` 绕开了 `PartOf=` 的 systemd 事务冲突，`restart` 正常。 |
+| uploader 崩了会影响识别吗？ | **不会**。`ExecStartPre=-...` 带 `-` 前缀（失败不阻塞），uploader 自身 `Restart=always` 独立重试。 |
 | 我想暂时关掉上传但不影响识别？ | `sudo systemctl stop sn-uploader` 单独停 uploader；恢复 `start` 即可，不用动 monitor。永久关：`sudo systemctl mask sn-uploader`。 |
 | 调机预览要不要单独起服务？ | **不用**。V3.0 起预览已经并进识别进程，`restart` 识别服务即同时起/停预览。 |
 

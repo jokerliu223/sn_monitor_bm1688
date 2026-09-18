@@ -4,8 +4,6 @@ After=network-online.target
 Wants=network-online.target
 # 单客户端摄像头源同一路只能一个进程拉流: 与 small 档服务互斥, 启一个自动停另一个, 杜绝抢流打架
 Conflicts=sn-monitor.service
-# ★ V3.0.1: start 时自动拉起 uploader sidecar（uploader 起不来不阻塞识别）
-Wants=sn-uploader.service
 
 [Service]
 Type=simple
@@ -16,11 +14,15 @@ WorkingDirectory=/data/soph_SN
 # ② 带 --rtsp2 双路(背面相机只抓帧不识别, 见 README 4.8)。
 # 摄像头 IP 变了要连同改这两行; 背面相机接在 eth1 那台路由器上(见 README 2.1)。
 ExecStart=/usr/bin/python3 /data/soph_SN/sn_monitor.py --rtsp rtsp://192.168.1.9:8554/live0 --idle 0 --mi 5 --profile big --rtsp2 rtsp://192.168.1.8:8554/live0
+# ★ V3.0.1: start 前先确保 uploader 在跑（已跑 = 跳过；'-' = 失败不阻塞识别）
+ExecStartPre=-/usr/bin/systemctl start sn-uploader
 Restart=always
 RestartSec=5
 # stop 时发 SIGINT -> 干净退出(release 发 TEARDOWN)
 KillSignal=SIGINT
 TimeoutStopSec=15
+# ★ V3.0.1: stop/restart 时自动停 uploader。前缀 '-' 表示即使 uploader 已停也不报错
+ExecStopPost=-/usr/bin/systemctl stop sn-uploader
 StandardOutput=append:/data/soph_SN/logs/sn_monitor.service.log
 StandardError=append:/data/soph_SN/logs/sn_monitor.service.log
 

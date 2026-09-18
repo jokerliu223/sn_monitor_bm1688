@@ -2,8 +2,8 @@
 Description=SN capture uploader (SE9 -> product_test)
 After=network-online.target
 Wants=network-online.target
-# ★ V3.0.1: 绑到 monitor 单元上 —— start/stop/enable monitor 时自动跟随，不用单独敲
-PartOf=sn-monitor.service sn-monitor-big.service
+# ★ V3.0.1: enable/start monitor 时自动跟随。stop 由 monitor 的 ExecStopPost 触发，
+#   不用 PartOf=(它导致 restart 时 systemd 事务冲突)
 
 [Service]
 Type=simple
