@@ -2,11 +2,13 @@
 
 SE9 / BM1688 算能板用 eth1 接一台路由器/交换机组成小局域网，从相机拉 RTSP 流，自动侦测板卡铭牌、识别序列号(SN)并落库。
 
-当前发布版本 **V3.0**。三种形态：
+当前发布版本 **V4.0**。四种形态：
 
 - **单路识别（默认）**：eth1 上挂一台相机对着板子正面，识别 SN。
 - **双路（V2.1，加 `--rtsp2`）**：再挂第二台相机对着背面，正面识别命中时同步抓一帧背面图，正/反两张一并上传、在产测网页成对展示。两路**各拉各的流、不合并**。
-- **调机预览（V3.0，默认开）**：把已解码的帧硬件编码成 MJPEG，经板子 `:8090` 推给产测网页的「调机预览台」，供人工调镜头。预览**与识别同进程、共享同一路解码**，相机源仍只有 1 条 RTSP 连接。（`:8090` 在**板子**上；产测网页在 **`.57` 的 `:8099`**，由 `.57` 中继转发，浏览器不直连板子 —— 见 6.1）
+- **调机预览（V3.0 MJPEG，保留可用）**：识别进程内嵌 JPEG 编码 → MJPEG HTTP 流 → `.57` 中继 → 浏览器 `<img>`。1080p 单路约 140ms 编码延迟，随识别服务启停（`:8090`）。`--no-preview` 关闭。
+- **调机预览（★ V4.0 WebRTC，新默认推荐）**：板子独立拉摄像头的**子码流**（`live1`, 768×572 HEVC），经 BM1688 硬件 H264 编码(`h264_bm`, <5ms) → RTMP push 到本地 MediaMTX → WebRTC 推给浏览器 `<video>`。**不经过识别进程、不占主码流、不重编码为 JPEG。** 延迟预期 <500ms。
+> **V4.0 相对 V3.0 的增量**：新增 WebRTC 预览管道（MediaMTX + `h264_bm` 硬件编码），用摄像头子码流独立拉流，不经过识别进程、不重编码为 JPEG。V3.0 MJPEG 预览保留为回退方案。
 > **V3.0 相对 V2.1 的增量**：内嵌调机预览（`sn_preview_embed.py` + `sn_monitor.py` 的 6 个 `--preview*` 参数）+ 只读抓拍回显接口 + 旧独立预览服务 `preview_service.py` 停用保留。
 > **识别逻辑逐字节不变**；不想要预览就加 `--no-preview`，行为等同 V2.1。
 >
@@ -88,41 +90,34 @@ SE9 / BM1688 算能板用 eth1 接一台路由器/交换机组成小局域网，
 
 ## 3. 部署
 
-### 3.1 ★ 两个服务的关系（V3.0.1 起启动时自动拉起）
-
-板上**实际跑两个独立进程**（各自独立的 systemd 单元，谁都不 spawn 谁），
-但 **V3.0.1 起 `start` monitor 时 uploader 自动跟随**——只需敲一条命令：
+### 3.1 ★ 服务关系（V4.0 新增 WebRTC 预览管道）
 
 ```
-        ┌──────────────────────────────────────────────┐
-        │  sn-monitor.service / sn-monitor-big.service │   ← 识别服务（按板型二选一）
-        │  sn_monitor.py --rtsp ... [--profile big]    │
-        │                                              │
-        │  内含：① 拉流 + 侦测 + OCR + 投票 + 落库      │
-        │        ② 调机预览（V3.0 起并入本进程，:8090） │
-        │                                              │
-        │  ExecStartPre=start uploader  ──► start 时自动拉起
-        │  ExecStopPost= stop  uploader  ──► stop/restart 时自动跟随
-        └──────────────────────┬───────────────────────┘
-                               │ 写 sn_results/*.json + *.jpg
-                               ▼
-        ┌──────────────────────────────────────────────┐
-        │  sn-uploader.service                         │   ← 上传 sidecar
-        │  sn_uploader.py --url ... --interval 3       │
-        │  监视 sn_results/，把结果 POST 到 .57         │
-        └──────────────────────────────────────────────┘
-
-        sn-preview.service  ✗ 已停用，deploy/ 里故意不放这个单元
+┌──────────────────────────────────────────────────────────────┐
+│  sn-monitor.service / sn-monitor-big.service                 │   ← 识别服务（按板型二选一）
+│  sn_monitor.py --rtsp ... [--profile big]                   │
+│                                                              │
+│  内含：① 拉流 + 侦测 + OCR + 投票 + 落库                      │
+│        ② MJPEG 预览（V3.0，回退用，:8090）                   │
+│              ExecStartPre=start uploader                     │
+│              ExecStopPost= stop  uploader                    │
+├──────────────────────────────────────────────────────────────┤
+│  sn-uploader.service                                         │   ← 上传 sidecar
+│  sn_uploader.py 监视 sn_results/ → POST .57:8099            │
+├──────────────────────────────────────────────────────────────┤
+│  ★ mediamtx.service                     ← V4.0 新增          │
+│  Go 单文件, RTMP→WebRTC 协议桥, :8889                        │
+├──────────────────────────────────────────────────────────────┤
+│  ★ sn-preview-ffmpeg.service            ← V4.0 新增          │
+│  sophon-ffmpeg 拉子码流 → h264_bm编码 → RTMP push localhost │
+└──────────────────────────────────────────────────────────────┘
 ```
 
 | 疑问 | 答案 |
 |------|------|
-| uploader 是包含在 `sn-monitor` 里面吗？ | **不是**（进程独立），但 **V3.0.1 起 monitor 的 `ExecStartPre`/`ExecStopPost` 自动管理 uploader 启停**——不靠代码 spawn，靠 systemd 指令。 |
-| 要手动启用几个服务？ | **一条命令** `systemctl enable --now sn-monitor-big`（或 `sn-monitor`）即可——`WantedBy=` 让 uploader 同时 enable。 |
-| restart monitor 会冲突吗？ | **不会**。用 `ExecStartPre`/`ExecStopPost` 绕开了 `PartOf=` 的 systemd 事务冲突，`restart` 正常。 |
-| uploader 崩了会影响识别吗？ | **不会**。`ExecStartPre=-...` 带 `-` 前缀（失败不阻塞），uploader 自身 `Restart=always` 独立重试。 |
-| 我想暂时关掉上传但不影响识别？ | `sudo systemctl stop sn-uploader` 单独停 uploader；恢复 `start` 即可，不用动 monitor。永久关：`sudo systemctl mask sn-uploader`。 |
-| 调机预览要不要单独起服务？ | **不用**。V3.0 起预览已经并进识别进程，`restart` 识别服务即同时起/停预览。 |
+| WebRTC 预览和识别是同一进程吗？ | **不是**。ffmpeg 独立拉摄像头的**子码流** `live1`（768×572 HEVC），与识别占的 `live0`（4K HEVC）是两条独立的 RTSP 连接，互不干扰。 |
+| 用 WebRTC 还是 MJPEG？ | **默认推荐 WebRTC**（延迟 <500ms）。MJPEG 保留为回退（`:8090`，`--no-preview` 关闭，`--preview-res 1080p` 降分辨率）。 |
+| 要手动启用几个服务？ | **两条命令**：`systemctl enable --now sn-monitor-big`（自动带起 uploader + MJPEG）+ `systemctl enable --now mediamtx sn-preview-ffmpeg`（WebRTC 管道）。
 
 ### 3.2 代码部署（板子上没有 git 仓库，走 scp）
 
@@ -188,7 +183,9 @@ sudo systemctl enable --now sn-uploader      # 上传 sidecar（可选，见 4.7
   tools/                 # 辅助工具（不参与识别主链路，按需运行）
     sn_uploader.py       #   命中结果 sidecar：上传 SN+命中帧到 .57 产测系统
     profile_probe.py     #   参数扫描工具：新模组快速定档
-  deploy/                # 三个 systemd 单元（模板，拷到 /etc 用）
+  deploy/                # systemd 单元（模板，拷到 /etc 用）
+    sn-monitor.service / sn-monitor-big.service / sn-uploader.service
+    mediamtx.service / sn-preview-ffmpeg.service  # ★ V4.0 WebRTC 管道
   docs/                  # 分册文档（CHANGELOG + features/ + tools/）
   README.md              # 本文档
 
@@ -202,6 +199,9 @@ sudo systemctl enable --now sn-uploader      # 上传 sidecar（可选，见 4.7
 /etc/systemd/system/sn-monitor.service       # ← deploy/ 拷入（小板，单路）
 /etc/systemd/system/sn-monitor-big.service   # ← deploy/ 拷入（大板，big 档 + 双路）
 /etc/systemd/system/sn-uploader.service      # ← deploy/ 拷入（上传 sidecar）
+/etc/systemd/system/mediamtx.service         # ★ V4.0 新增 MediaMTX
+/etc/systemd/system/sn-preview-ffmpeg.service # ★ V4.0 新增 ffmpeg 推流
+/opt/mediamtx/mediamtx                       # ★ V4.0 新增 MediaMTX 二进制 (ARM64, ~28MB)
 ```
 
 > **`profile_probe.py` 不在板上**（未随部署上板），要用得先 scp 到板子根目录，见 [docs/tools/profile-probe.md](docs/tools/profile-probe.md)。
@@ -370,9 +370,66 @@ sudo python3 /data/soph_SN/sn_uploader.py --url http://10.80.40.57:8099/api/v1/c
 |------|--------|------|
 | **上传 sidecar** | `sn_uploader.py` 怎么监视目录、怎么去重、为什么"首次启用会回灌历史"、为什么要 root | [docs/features/uploader.md](docs/features/uploader.md) |
 | **双路摄像头** | 两路为什么"分开拉流不合并"、正反靠时间戳复制配对、`.57` 侧升级要 `ALTER TABLE` | [docs/features/dual-camera.md](docs/features/dual-camera.md) |
-| **调机预览 V3.0** | 为什么必须内嵌（单客户端源）、6 个参数、实测编码耗时、三级回退路径 | [docs/features/preview-v3.md](docs/features/preview-v3.md) |
+| **调机预览 V3.0 (MJPEG)** | 为什么必须内嵌（单客户端源）、6 个参数、实测编码耗时、三级回退路径 | [docs/features/preview-v3.md](docs/features/preview-v3.md) |
+| **调机预览 ★ V4.0 (WebRTC)** | 子码流独立拉流 + `h264_bm` 硬件编码 + MediaMTX 推 WebRTC，延迟 <500ms。部署见下方 4.8 |  |
 | **参数扫描工具** | 新模组怎么快速定档、`profile_probe.py` 怎么用、输出怎么读 | [docs/tools/profile-probe.md](docs/tools/profile-probe.md) |
 | **版本演进** | V0.8 → V3.0 逐版改了什么、每个坑的根因 | [docs/CHANGELOG.md](docs/CHANGELOG.md) |
+
+### 4.8 ★ V4.0 WebRTC 预览部署（低延迟，推荐）
+
+#### 原理
+
+```
+Camera /live1 (HEVC 768×572, 子码流)
+  │ ffmpeg -rtsp_transport tcp 拉流
+  │ 不经过识别进程，不占主码流
+  ▼
+sophon-ffmpeg h264_bm 硬件编码 (<5ms)
+  │ 768×572 → H264, ~1.3Mbps
+  ▼
+RTMP push → localhost:1935
+  ▼
+MediaMTX (Go 单文件, ~6MB RAM)
+  │ RTMP→WebRTC 协议转换, 零编码
+  ▼
+WebRTC (WHEP) :8889 → 浏览器 <video>
+
+延迟预期: <500ms (H264 编码 <5ms + 网络 1-7ms + WebRTC 协商)
+```
+
+#### 部署步骤（一次性）
+
+```bash
+# ① 安装 MediaMTX（ARM64 二进制）
+cd /tmp && wget https://github.com/bluenviron/mediamtx/releases/download/v1.8.0/mediamtx_v1.8.0_linux_arm64v8.tar.gz
+sudo mkdir -p /opt/mediamtx && sudo tar xzf mediamtx_v1.8.0_linux_arm64v8.tar.gz -C /opt/mediamtx/
+
+# ② 装 systemd 单元
+sudo cp /data/soph_SN/deploy/mediamtx.service /etc/systemd/system/
+sudo cp /data/soph_SN/deploy/sn-preview-ffmpeg.service /etc/systemd/system/
+sudo systemctl daemon-reload
+
+# ③ 启用（WebRTC 管道)
+sudo systemctl enable --now mediamtx sn-preview-ffmpeg
+
+# ④ 确认
+systemctl is-active mediamtx sn-preview-ffmpeg
+# 应 all "active"
+```
+
+#### 在浏览器使用
+
+前端「调机预览台」页面切换到 **WebRTC** 模式（下拉框），浏览器直接与板子 `10.80.40.53:8889` 建 WebRTC 连接。如果在办公网打不开 `10.80.40.53:8889`，需要 `.57` 做反向代理或确认防火墙放行。
+
+#### 回退到 MJPEG（如果 WebRTC 不可用）
+
+```bash
+sudo systemctl stop mediamtx sn-preview-ffmpeg
+sudo systemctl disable mediamtx sn-preview-ffmpeg
+# 识别服务自身带的 MJPEG :8090 仍然在跑，浏览器切回"MJPEG"模式
+```
+
+> **子码流 URL 因摄像头型号而异**。本部署假设 `rtsp://192.168.1.9:8554/live1`（已实测通过，768×572 HEVC 20fps）。翻摄像头管理页或 `ffprobe` 确认你的相机的子码流地址，改 `sn-preview-ffmpeg.service` 的 `ExecStart` 里对应的 RTSP URL。
 
 ---
 
@@ -389,7 +446,8 @@ sudo python3 /data/soph_SN/sn_uploader.py --url http://10.80.40.57:8099/api/v1/c
 | 模型释放太快/太慢 | 调 `--ocr-idle-unload`(慢→调小，常驻→设 0) |
 | 误报别的字段 | 收紧 `--sn-min-len/max-len` 或加 `--sn-prefix` |
 | **`:8090` 打不开 / 预览起不来** | 是不是加了 `--no-preview`？Flask 装了没？日志里应有 `📺 预览已启动` 或一行警告——预览起不来不影响识别 |
-| **预览画面卡顿** | 网页工具栏切 `1080p`（识别用的图不受影响）。详见 [preview-v3.md](docs/features/preview-v3.md) |
+| **预览画面卡顿** | 网页工具栏切 `1080p`（识别用的图不受影响）。或切换到 **WebRTC 模式**（见 4.8） |
+| **WebRTC 黑屏无画面** | ① `systemctl is-active mediamtx sn-preview-ffmpeg` — 两个都在跑？② `journalctl -u sn-preview-ffmpeg -n 5` — ffmpeg 是否报错？③ 浏览器控制台是否有 WebRTC ICE 连接失败？（办公网到 `10.80.40.53:8889` 是否可达？） |
 | **双路：第二路没接上** | 启动日志有 `⚠ 第二路 ... 暂不可达, 本次降级为单路` = 正常降级。查：相机2 是否接在同一台路由器/交换机？`ping 192.168.1.8`？`ip route get 192.168.1.8` 是否回 `dev eth1`？端口 `8554` 可连？ |
 | **双路：背面图不变/是旧画面** | 相机2 推流是否真在动？背面**无断线自愈**，掉线需重启服务。详见 [dual-camera.md](docs/features/dual-camera.md) |
 | **双路：卡片只显示正面** | ① 上传是否带 `side`？② `.57` 库里那两行 `captured_at` 是否真的一致？③ 老库是否忘了 `ALTER TABLE ... ADD COLUMN side`？见 [dual-camera.md](docs/features/dual-camera.md) |

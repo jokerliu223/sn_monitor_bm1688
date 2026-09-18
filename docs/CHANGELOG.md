@@ -35,7 +35,26 @@
 
 ## 逐版说明
 
-### V3.0.1 —— 服务合并（一条命令启动全部）【最新】
+### V4.0 —— WebRTC 预览（低延迟，独立管道）【最新】
+
+**解决的问题**：V3.0 MJPEG 预览延迟高达 2 分钟。根因：4K MJPEG 帧体巨大(~3.5MB)+ 连续字节流无帧丢弃 → TCP 缓冲区无界积压。
+
+**做法**：利用摄像头**子码流**（`live1`, 768×572 HEVC），板上起独立 `sophon-ffmpeg` 进程拉流 → BM1688 硬件 H264 编码(`h264_bm`, <5ms) → RTMP push 到本地 MediaMTX → WebRTC 推给浏览器 `<video>`。
+不经过识别进程、不新增 JPEG 编码、不占主码流。
+
+**新增文件**：
+- `deploy/mediamtx.service`：MediaMTX systemd 单元（Go 单文件, ~6MB RAM）
+- `deploy/sn-preview-ffmpeg.service`：ffmpeg 推流 systemd 单元
+
+**部署**（一次性）：
+```bash
+# 安装 MediaMTX ARM64 二进制 + systemd 单元 → enable
+sudo systemctl enable --now mediamtx sn-preview-ffmpeg
+```
+
+**回退**：`systemctl stop mediamtx sn-preview-ffmpeg` → MJPEG `:8090` 仍在跑，前端切回 MJPEG 模式。
+
+### V3.0.1 —— 服务合并 + 1080p 默认
 
 **改动**：deploy/ 三个 systemd 单元各加 1–2 行（`Wants=` + `PartOf=` + `WantedBy=`），
 实现 `systemctl enable --now sn-monitor-big` 一条命令同时拉起识别+预览+上传。

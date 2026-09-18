@@ -1,0 +1,17 @@
+[Unit]
+Description=MediaMTX media server (RTMP→WebRTC relay)
+After=network-online.target
+Wants=network-online.target
+# V4.0: 随识别服务启停，预览管道从 MJPEG 换成 WebRTC
+
+[Service]
+Type=simple
+User=root
+ExecStart=/opt/mediamtx/mediamtx /opt/mediamtx/mediamtx.yml
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

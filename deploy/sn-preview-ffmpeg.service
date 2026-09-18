@@ -1,0 +1,26 @@
+[Unit]
+Description=SN preview ffmpeg push (camera sub-stream → MediaMTX)
+After=network-online.target mediamtx.service
+Wants=network-online.target mediamtx.service
+# V4.0: 独立进程拉子码流 → HW H264编码 → RTMP push → MediaMTX → WebRTC
+# 不与识别进程共享 RTSP 连接，各自拉独立的流
+
+[Service]
+Type=simple
+User=root
+# h264_bm: BM1688 硬件 H264 编码器
+# -rtsp_transport tcp: 强制 TCP（摄像头单客户端要求）
+# -g 30: 每 30 帧一个关键帧（GOP=1.5s at 20fps）
+ExecStart=/opt/sophon/sophon-ffmpeg_2.2.0/bin/ffmpeg \
+  -rtsp_transport tcp -i rtsp://192.168.1.9:8554/live1 \
+  -an -c:v h264_bm -b:v 2M -g 30 -pix_fmt nv12 \
+  -f flv rtmp://127.0.0.1:1935/cam_front
+Restart=always
+RestartSec=5
+KillSignal=SIGINT
+TimeoutStopSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
