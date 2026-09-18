@@ -18,4 +18,5 @@ StandardOutput=journal
 StandardError=journal
 
 [Install]
-WantedBy=multi-user.target
+# ★ V3.0.1: enable monitor 时自动 enable 本单元
+WantedBy=sn-monitor.service sn-monitor-big.service multi-user.target
