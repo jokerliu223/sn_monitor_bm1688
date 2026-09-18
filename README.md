@@ -6,13 +6,11 @@ SE9 / BM1688 算能板用 eth1 接一台路由器/交换机组成小局域网，
 
 - **单路识别（默认）**：eth1 上挂一台相机对着板子正面，识别 SN。
 - **双路（V2.1，加 `--rtsp2`）**：再挂第二台相机对着背面，正面识别命中时同步抓一帧背面图，正/反两张一并上传、在产测网页成对展示。两路**各拉各的流、不合并**。
-- **调机预览（V3.0 MJPEG，保留可用）**：识别进程内嵌 JPEG 编码 → MJPEG HTTP 流 → `.57` 中继 → 浏览器 `<img>`。1080p 单路约 140ms 编码延迟，随识别服务启停（`:8090`）。`--no-preview` 关闭。
-- **调机预览（★ V4.0 WebRTC，新默认推荐）**：板子独立拉摄像头的**子码流**（`live1`, 768×572 HEVC），经 BM1688 硬件 H264 编码(`h264_bm`, <5ms) → RTMP push 到本地 MediaMTX → WebRTC 推给浏览器 `<video>`。**不经过识别进程、不占主码流、不重编码为 JPEG。** 延迟预期 <500ms。
-> **V4.0 相对 V3.0 的增量**：新增 WebRTC 预览管道（MediaMTX + `h264_bm` 硬件编码），用摄像头子码流独立拉流，不经过识别进程、不重编码为 JPEG。V3.0 MJPEG 预览保留为回退方案。
-> **V3.0 相对 V2.1 的增量**：内嵌调机预览（`sn_preview_embed.py` + `sn_monitor.py` 的 6 个 `--preview*` 参数）+ 只读抓拍回显接口 + 旧独立预览服务 `preview_service.py` 停用保留。
-> **识别逻辑逐字节不变**；不想要预览就加 `--no-preview`，行为等同 V2.1。
->
-> **历史版本（V0.8 → V3.0）逐版说明见 [docs/CHANGELOG.md](docs/CHANGELOG.md)。**
+- **调机预览（★ V4.0 WebRTC）**：板子上 `sophon-ffmpeg` 独立拉摄像头**子码流** (`live1`, 768×572 HEVC)，经 BM1688 硬件 H264 编码 (`h264_bm`, <5ms) → RTMP 推流到 **.57 服务器** → `.57` 上的 MediaMTX 转 WebRTC → 前端 `<video>` 实时播放。**不经过识别进程、不占主码流、不重编码为 JPEG。** 延迟 <500ms。
+- **调机预览（V3.0 MJPEG，已废弃）**：识别进程内嵌 JPEG 编码 → MJPEG → `.57` 中继。V4.0 替换，不再使用。
+
+> **V4.0 核心变更**：预览管道从 MJPEG(板子重编码) 换为 WebRTC(子码流直通)，延迟从分钟级降到实时。板子新增两个 ffmpeg 推流服务，`.57` 新增 MediaMTX 协议转换服务。
+> **历史版本（V0.8 → V4.0）逐版说明见 [docs/CHANGELOG.md](docs/CHANGELOG.md)。**
 > 本 README 只讲**当前版本怎么部署、怎么用**。
 
 ---
@@ -90,34 +88,48 @@ SE9 / BM1688 算能板用 eth1 接一台路由器/交换机组成小局域网，
 
 ## 3. 部署
 
-### 3.1 ★ 服务关系（V4.0 新增 WebRTC 预览管道）
+### 3.1 ★ 服务关系与通信流程（V4.0）
 
 ```
-┌──────────────────────────────────────────────────────────────┐
-│  sn-monitor.service / sn-monitor-big.service                 │   ← 识别服务（按板型二选一）
-│  sn_monitor.py --rtsp ... [--profile big]                   │
-│                                                              │
-│  内含：① 拉流 + 侦测 + OCR + 投票 + 落库                      │
-│        ② MJPEG 预览（V3.0，回退用，:8090）                   │
-│              ExecStartPre=start uploader                     │
-│              ExecStopPost= stop  uploader                    │
-├──────────────────────────────────────────────────────────────┤
-│  sn-uploader.service                                         │   ← 上传 sidecar
-│  sn_uploader.py 监视 sn_results/ → POST .57:8099            │
-├──────────────────────────────────────────────────────────────┤
-│  ★ mediamtx.service                     ← V4.0 新增          │
-│  Go 单文件, RTMP→WebRTC 协议桥, :8889                        │
-├──────────────────────────────────────────────────────────────┤
-│  ★ sn-preview-ffmpeg.service            ← V4.0 新增          │
-│  sophon-ffmpeg 拉子码流 → h264_bm编码 → RTMP push localhost │
-└──────────────────────────────────────────────────────────────┘
+【板子 10.80.40.53】
+  sn-monitor-big.service  识别+上传 (OCR, 不变)
+  ├─ live0 (4K HEVC) → OCR → sn_results/
+  ├─ sn-uploader → POST .57:8099
+  └─ MJPEG :8090 (V3.0, 前端不再使用)
+
+  ★ sn-preview-ffmpeg.service  正面预览
+  │  ffmpeg → live1 @ 192.168.1.9:8554 → h264_bm → RTMP → .57:1935/cam_front
+  ★ sn-preview-ffmpeg-back.service  背面预览
+  │  ffmpeg → live1 @ 192.168.1.8:8554 → h264_bm → RTMP → .57:1935/cam_back
+                    │
+                    │ RTMP (TCP, H264 byte stream)
+                    ▼
+【.57 10.80.40.57】
+  ★ MediaMTX (start.sh 内置启动, :8889)
+  │  RTMP :1935 ← 板子推流
+  │  WebRTC :8889 WHEP endpoint
+  │  ICE/UDP :8189 媒体传输
+  │  零编码 — 只做 RTMP→WebRTC 协议转换
+  uvicorn :8099
+  ├─ /api/v1/camera/webrtc/config    → 返回配置
+  └─ /api/v1/camera/webrtc/whep/{cam} → WHEP代理 → localhost:8889
+                    │
+                    │ WebRTC (WHEP + UDP/RTP)
+                    ▼
+【浏览器】
+  CameraPreviewView.vue (纯 WebRTC, 无 MJPEG)
+  ├─ <video> × 2 (front + back)
+  ├─ RTCPeerConnection + WHEP 握手
+  └─ ICE 断线自动重连
 ```
 
 | 疑问 | 答案 |
 |------|------|
-| WebRTC 预览和识别是同一进程吗？ | **不是**。ffmpeg 独立拉摄像头的**子码流** `live1`（768×572 HEVC），与识别占的 `live0`（4K HEVC）是两条独立的 RTSP 连接，互不干扰。 |
-| 用 WebRTC 还是 MJPEG？ | **默认推荐 WebRTC**（延迟 <500ms）。MJPEG 保留为回退（`:8090`，`--no-preview` 关闭，`--preview-res 1080p` 降分辨率）。 |
-| 要手动启用几个服务？ | **两条命令**：`systemctl enable --now sn-monitor-big`（自动带起 uploader + MJPEG）+ `systemctl enable --now mediamtx sn-preview-ffmpeg`（WebRTC 管道）。
+| WebRTC 和识别是同一进程吗？ | **不是**。ffmpeg 独立拉**子码流** `live1`（768×572 HEVC），与识别占的 `live0`（4K HEVC）互不干扰。 |
+| 需要启用几个服务？ | 板子: `systemctl enable --now sn-preview-ffmpeg sn-preview-ffmpeg-back`。.57: `./start.sh`。 |
+| uploader 崩了影响识别吗？ | **不会**。独立进程，`Restart=always` 自行恢复。 |
+| ffmpeg 推流崩了影响识别吗？ | **不会**。独立进程拉子码流，与识别的主码流无关。 |
+| h264_bm 能用 pipe 输入吗？ | **不能**。只接受 BM1688 硬件解码器输出的 BM-native 帧，必须用 `-i rtsp://...`。 |
 
 ### 3.2 代码部署（板子上没有 git 仓库，走 scp）
 
@@ -375,65 +387,83 @@ sudo python3 /data/soph_SN/sn_uploader.py --url http://10.80.40.57:8099/api/v1/c
 | **参数扫描工具** | 新模组怎么快速定档、`profile_probe.py` 怎么用、输出怎么读 | [docs/tools/profile-probe.md](docs/tools/profile-probe.md) |
 | **版本演进** | V0.8 → V3.0 逐版改了什么、每个坑的根因 | [docs/CHANGELOG.md](docs/CHANGELOG.md) |
 
-### 4.8 ★ V4.0 WebRTC 预览部署（低延迟，推荐）
+### 4.8 ★ V4.0 WebRTC 预览部署'):c.find('## 5. 排障速查')]
 
-#### 原理
+new = """### 4.8 ★ V4.0 WebRTC 预览部署
+
+#### 完整通信流程
 
 ```
-Camera /live1 (HEVC 768×572, 子码流)
-  │ ffmpeg -rtsp_transport tcp 拉流
-  │ 不经过识别进程，不占主码流
-  ▼
-sophon-ffmpeg h264_bm 硬件编码 (<5ms)
-  │ 768×572 → H264, ~1.3Mbps
-  ▼
-RTMP push → localhost:1935
-  ▼
-MediaMTX (Go 单文件, ~6MB RAM)
-  │ RTMP→WebRTC 协议转换, 零编码
-  ▼
-WebRTC (WHEP) :8889 → 浏览器 <video>
-
-延迟预期: <500ms (H264 编码 <5ms + 网络 1-7ms + WebRTC 协商)
+板子 10.80.40.53                              .57 10.80.40.57                    浏览器
+sn-preview-ffmpeg
+  ffmpeg -i live1                             mediamtx (start.sh)
+   -> h264_bm HW编码 (<5ms)                      RTMP :1935 <- 接收推流
+   -> RTMP push ------------------------------>   WebRTC :8889
+                                                   ICE/UDP :8189
+sn-preview-ffmpeg-back
+  ffmpeg -i live1(.8)                           uvicorn :8099
+   -> h264_bm                                    /webrtc/config
+   -> RTMP push ------------------------------>   /webrtc/whep/{cam} <- 浏览器 POST
+                                                    -> proxy -> localhost:8889
+                                                                               CameraPreviewView.vue
+                                                                                 RTCPeerConnection
+                                                                                 WHEP POST SDP offer
+                                                                                 setRemoteDescription(answer)
+                                                                                 <video> x 2
+                                                                                 ICE disconnect -> auto retry
 ```
 
-#### 部署步骤（一次性）
+关键设计决策:
+- **子码流独立**: ffmpeg 拉 `live1` 子码流 (768x572 HEVC, 与识别主码流 `live0` 不同连接), 不占识别资源
+- **MediaMTX 放 .57**: 与浏览器同源网络 (10.80.40.x), ICE 不跨网段
+- **WHEP 代理**: .57 后端转发 SDP -> 本地 MediaMTX (127.0.0.1:8889), 避免浏览器直连板子的跨域问题
+- **h264_bm 限制**: 只接受 BM1688 硬件解码器输出的 BM-native 帧, 不能用 pipe:0 软件管道
+
+#### 板子端部署
 
 ```bash
-# ① 安装 MediaMTX（ARM64 二进制）
-cd /tmp && wget https://github.com/bluenviron/mediamtx/releases/download/v1.8.0/mediamtx_v1.8.0_linux_arm64v8.tar.gz
-sudo mkdir -p /opt/mediamtx && sudo tar xzf mediamtx_v1.8.0_linux_arm64v8.tar.gz -C /opt/mediamtx/
-
-# ② 装 systemd 单元
-sudo cp /data/soph_SN/deploy/mediamtx.service /etc/systemd/system/
+# 部署 ffmpeg 推流单元
 sudo cp /data/soph_SN/deploy/sn-preview-ffmpeg.service /etc/systemd/system/
+sudo cp /data/soph_SN/deploy/sn-preview-ffmpeg-back.service /etc/systemd/system/
 sudo systemctl daemon-reload
-
-# ③ 启用（WebRTC 管道)
-sudo systemctl enable --now mediamtx sn-preview-ffmpeg
-
-# ④ 确认
-systemctl is-active mediamtx sn-preview-ffmpeg
-# 应 all "active"
+sudo systemctl enable --now sn-preview-ffmpeg sn-preview-ffmpeg-back
 ```
 
-#### 在浏览器使用
-
-前端「调机预览台」页面切换到 **WebRTC** 模式（下拉框），浏览器直接与板子 `10.80.40.53:8889` 建 WebRTC 连接。如果在办公网打不开 `10.80.40.53:8889`，需要 `.57` 做反向代理或确认防火墙放行。
-
-#### 回退到 MJPEG（如果 WebRTC 不可用）
+#### .57 服务器端部署
 
 ```bash
-sudo systemctl stop mediamtx sn-preview-ffmpeg
-sudo systemctl disable mediamtx sn-preview-ffmpeg
-# 识别服务自身带的 MJPEG :8090 仍然在跑，浏览器切回"MJPEG"模式
+# 1) 下载 MediaMTX (仅首次, x86_64)
+cd /tmp && wget https://github.com/bluenviron/mediamtx/releases/download/v1.8.0/mediamtx_v1.8.0_linux_amd64.tar.gz
+sudo mkdir -p /opt/mediamtx && sudo tar xzf mediamtx_v1.8.0_linux_amd64.tar.gz -C /opt/mediamtx/
+
+# 2) 配置文件: product_test/mediamtx.yml
+#    rtmp: yes, rtmpAddress: :1935
+#    webrtc: yes, webrtcAddress: :8889
+#    srt: no  (避免端口 8000 冲突)
+
+# 3) 启动: start.sh 已集成
+#    pkill -f mediamtx 2>/dev/null  # 杀旧进程
+#    /opt/mediamtx/mediamtx mediamtx.yml &  # 后台启动
+#    trap "kill $MEDIAMTX_PID" EXIT  # 随 start.sh 退出自动清理
+cd /media/cvitek/xiaohao.liu/product_test
+./start.sh
 ```
 
-> **子码流 URL 因摄像头型号而异**。本部署假设 `rtsp://192.168.1.9:8554/live1`（已实测通过，768×572 HEVC 20fps）。翻摄像头管理页或 `ffprobe` 确认你的相机的子码流地址，改 `sn-preview-ffmpeg.service` 的 `ExecStart` 里对应的 RTSP URL。
+#### 验证
 
----
+```bash
+# .57 MediaMTX 流状态 (应该 ready=true)
+curl -s http://127.0.0.1:9997/v3/paths/list | python3 -m json.tool
 
-## 5. 排障速查
+# 板子 ffmpeg 服务
+systemctl is-active sn-preview-ffmpeg sn-preview-ffmpeg-back
+# 应: active active
+
+# 浏览器: F12 控制台
+# 应: WebRTC front connected / WebRTC back connected
+```
+
+> **排障**: 如果一直"WebRTC 连接中...", 先确认 .57 的 `./start.sh` 已执行, 再检查 `cam_front ready=true`。## 5. 排障速查
 
 | 现象 | 排查 |
 |------|------|
