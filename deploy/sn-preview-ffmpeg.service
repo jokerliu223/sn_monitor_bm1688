@@ -1,7 +1,9 @@
 [Unit]
 Description=SN preview ffmpeg push (camera sub-stream → MediaMTX)
 After=network-online.target mediamtx.service
-Wants=network-online.target mediamtx.service
+Requires=mediamtx.service
+BindsTo=mediamtx.service
+Wants=network-online.target
 # V4.0: 独立进程拉子码流 → HW H264编码 → RTMP push → MediaMTX → WebRTC
 # 不与识别进程共享 RTSP 连接，各自拉独立的流
 
