@@ -13,15 +13,17 @@ WorkingDirectory=/data/soph_SN
 # --idle 0: 永不因空闲退出; 源未起时 reconnect() 轻量探活等待, 不狂刷 ffmpeg
 # v2.1 第二路(背面)就绪后, 在下行末尾追加: --rtsp2 rtsp://<cam2-ip>:8554/live0  (不加=单路, 零影响)
 ExecStart=/usr/bin/python3 /data/soph_SN/sn_monitor.py --rtsp rtsp://192.168.1.9:8554/live0 --idle 0 --mi 5 --preview-res 1080p --preview-fps 8.0
-# ★ V3.0.1: start 前先确保 uploader 在跑（已跑 = 跳过；'-' = 失败不阻塞识别）
+# ★ V3.0.1: start 前确保 uploader + ffmpeg 推流在跑（'-' = 失败不阻塞识别）
 ExecStartPre=-/usr/bin/systemctl start sn-uploader
+ExecStartPre=-/usr/bin/systemctl start sn-preview-ffmpeg
 Restart=always
 RestartSec=5
 # stop 时发 SIGINT -> v9 干净退出(release 发 TEARDOWN)
 KillSignal=SIGINT
 TimeoutStopSec=15
-# ★ V3.0.1: stop/restart 时自动停 uploader。前缀 '-' 表示即使 uploader 已停也不报错
+# ★ V3.0.1: stop/restart 时自动停 uploader + ffmpeg 推流
 ExecStopPost=-/usr/bin/systemctl stop sn-uploader
+ExecStopPost=-/usr/bin/systemctl stop sn-preview-ffmpeg
 StandardOutput=append:/data/soph_SN/logs/sn_monitor.service.log
 StandardError=append:/data/soph_SN/logs/sn_monitor.service.log
 

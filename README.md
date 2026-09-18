@@ -126,7 +126,7 @@ SE9 / BM1688 算能板用 eth1 接一台路由器/交换机组成小局域网，
 | 疑问 | 答案 |
 |------|------|
 | WebRTC 和识别是同一进程吗？ | **不是**。ffmpeg 独立拉**子码流** `live1`（768×572 HEVC），与识别占的 `live0`（4K HEVC）互不干扰。 |
-| 需要启用几个服务？ | 板子: `systemctl enable --now sn-preview-ffmpeg sn-preview-ffmpeg-back`。.57: `./start.sh`。 |
+| 需要启用几个服务？ | **一条命令**: `systemctl enable --now sn-monitor-big` (ExecStartPre 自动拉起 uploader + ffmpeg 推流)。.57: `./start.sh`。 |
 | uploader 崩了影响识别吗？ | **不会**。独立进程，`Restart=always` 自行恢复。 |
 | ffmpeg 推流崩了影响识别吗？ | **不会**。独立进程拉子码流，与识别的主码流无关。 |
 | h264_bm 能用 pipe 输入吗？ | **不能**。只接受 BM1688 硬件解码器输出的 BM-native 帧，必须用 `-i rtsp://...`。 |
@@ -259,70 +259,22 @@ python3 ppocr_system_opencv.py \
 
 ## 4. 使用
 
-### 4.1 ★ 两步跑起来（V3.0.1 起 uploader 自动跟随）
-
-**先决**：板子 SSH `linaro@10.80.40.53`；摄像头 `rtsp://192.168.1.9:8554/live0`；工作目录 `/data/soph_SN`。
+### 4.1 ★ 一条命令启动全部
 
 ```bash
-# ① 装单元（首次部署；三个可以一次全拷，启用谁看工位）
-sudo cp /data/soph_SN/deploy/sn-monitor.service \
-        /data/soph_SN/deploy/sn-monitor-big.service \
-        /data/soph_SN/deploy/sn-uploader.service /etc/systemd/system/
+# 首次部署：装单元
+sudo cp /data/soph_SN/deploy/sn-monitor-big.service /etc/systemd/system/
+sudo cp /data/soph_SN/deploy/sn-uploader.service /etc/systemd/system/
+sudo cp /data/soph_SN/deploy/sn-preview-ffmpeg.service /etc/systemd/system/
+sudo cp /data/soph_SN/deploy/sn-preview-ffmpeg-back.service /etc/systemd/system/
 sudo systemctl daemon-reload
 
-# ② 一条命令启用（识别+预览+上传全部拉起）
-sudo systemctl enable --now sn-monitor-big      # 大板。小板工位改用 sn-monitor
-
-# 之后放板即自动「识别 → 落盘 → 上传」，无需再敲任何命令。看实时日志：
-tail -f /data/soph_SN/logs/sn_monitor.service.log
-journalctl -u sn-uploader -f                    # 上传日志（独立）
+# 一条命令：识别 + 上传 + WebRTC 预览全拉起来
+sudo systemctl enable --now sn-monitor-big
 ```
 
-> 换板型：`sudo systemctl disable --now sn-monitor && sudo systemctl enable --now sn-monitor-big`（反之亦然）。
-> 两个单元互斥（`Conflicts=`），enable 其一会自动停另一个。
-> **大板工位默认就是双路**（`--rtsp2` 已写死在单元里）；只装一台相机的大板工位，把那行末尾的 `--rtsp2 ...` 删掉即回到单路。
-> **小板单元是单路**，要双路得自己往末尾追加 `--rtsp2 ...`，再 `daemon-reload && restart`。详见 [docs/features/dual-camera.md](docs/features/dual-camera.md)。
->
-> **临时关上传**：`sudo systemctl stop sn-uploader`（不影响识别）。永久关：`sudo systemctl mask sn-uploader`。
-
-### 4.2 常用运维命令
-
-把 `<svc>` 换成实际的单元名（`sn-monitor` / `sn-monitor-big`）：
-
-```bash
-sudo systemctl start   <svc>      # 启动
-sudo systemctl stop    <svc>      # 停止（★ 会杀源，需配合摄像头重启）
-sudo systemctl restart <svc>      # 重启（★ 务必同时重启摄像头推流）
-sudo systemctl status  <svc>
-tail -f /data/soph_SN/logs/sn_monitor.service.log     # 识别日志（不进 journalctl）
-journalctl -u sn-uploader -f                          # 上传日志
-```
-
-单元配置要点：`--idle 0`（永不超时）、`KillSignal=SIGINT`（干净 TEARDOWN 保住下次可拉流）、`Restart=always`。
-
-### 4.3 手动前台跑（调试，最直观）
-
-```bash
-sudo systemctl stop sn-monitor        # 先停服务让出摄像头源（手动跑也抢同一个源，不能并存）
-cd /data/soph_SN
-
-# 小板（默认档 small，不带 --profile）
-sudo python3 sn_monitor.py --rtsp rtsp://192.168.1.9:8554/live0 --idle 0
-# 大板（必须带 --profile big）
-sudo python3 sn_monitor.py --rtsp rtsp://192.168.1.9:8554/live0 --idle 0 --profile big
-# 大板 + 双路（V2.1 正/反两面）
-sudo python3 sn_monitor.py --rtsp rtsp://192.168.1.9:8554/live0 --idle 0 --profile big \
-     --rtsp2 rtsp://192.168.1.8:8554/live0
-# 只想要识别、不要预览（等同 V2.1 行为）
-sudo python3 sn_monitor.py --rtsp rtsp://192.168.1.9:8554/live0 --idle 0 --no-preview
-# ★ 手动跑也会杀源：启动后 / Ctrl-C 结束后，都要同时重启摄像头推流（双路时两台都要）
-
-# 如需上传（可选，另开一个终端；不上传就不用起）
-sudo python3 /data/soph_SN/sn_uploader.py --url http://10.80.40.57:8099/api/v1/captures --interval 3
-```
-
-> 大板/小板唯一区别就是 `--profile`（一次切换裁剪几何/上采样/确认门，见 4.4）。
-> 结果落在 `/data/soph_SN/sn_results/`（`sn_<SN>_<ts>.json` + 命中帧 `.jpg`）。
+> 换板型: `disable --now sn-monitor && enable --now sn-monitor-big`。
+> ExecStartPre/ExecStopPost 自动管理 uploader + ffmpeg 推流服务的启停，失败不阻塞识别。
 
 ### 4.4 档位系统（V2.0.1 核心）
 
@@ -371,23 +323,17 @@ sudo python3 /data/soph_SN/sn_uploader.py --url http://10.80.40.57:8099/api/v1/c
 
 > 稳定性兜底参数 `--wedge-*` / `--stale-*` 一般不用动。预览参数完整说明见 [docs/features/preview-v3.md](docs/features/preview-v3.md)。
 
-### 4.6 更新脚本到板子
-
-见 **3.2 代码部署**：scp 上板 → `py_compile` 自检 → `systemctl restart <svc>`（★ 记得同时重启摄像头推流）。
-只有 `deploy/*.service` 变了才需要按 3.3 重装单元 + `daemon-reload`。
-
 ### 4.7 功能分册索引（正文已搬走，这里只留入口）
 
 | 主题 | 一句话 | 分册 |
 |------|--------|------|
 | **上传 sidecar** | `sn_uploader.py` 怎么监视目录、怎么去重、为什么"首次启用会回灌历史"、为什么要 root | [docs/features/uploader.md](docs/features/uploader.md) |
 | **双路摄像头** | 两路为什么"分开拉流不合并"、正反靠时间戳复制配对、`.57` 侧升级要 `ALTER TABLE` | [docs/features/dual-camera.md](docs/features/dual-camera.md) |
-| **调机预览 V3.0 (MJPEG)** | 为什么必须内嵌（单客户端源）、6 个参数、实测编码耗时、三级回退路径 | [docs/features/preview-v3.md](docs/features/preview-v3.md) |
 | **调机预览 ★ V4.0 (WebRTC)** | 子码流独立拉流 + `h264_bm` 硬件编码 + MediaMTX 推 WebRTC，延迟 <500ms。部署见下方 4.8 |  |
 | **参数扫描工具** | 新模组怎么快速定档、`profile_probe.py` 怎么用、输出怎么读 | [docs/tools/profile-probe.md](docs/tools/profile-probe.md) |
 | **版本演进** | V0.8 → V3.0 逐版改了什么、每个坑的根因 | [docs/CHANGELOG.md](docs/CHANGELOG.md) |
 
-### 4.8 ★ V4.0 WebRTC 预览部署'):c.find('## 5. 排障速查')]
+### 4.8 ★ V4.0 WebRTC 预览部署]
 
 new = """### 4.8 ★ V4.0 WebRTC 预览部署
 
