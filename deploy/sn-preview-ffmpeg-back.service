@@ -1,0 +1,21 @@
+[Unit]
+Description=SN preview ffmpeg push back (camera sub-stream -> MediaMTX)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=/opt/sophon/sophon-ffmpeg_2.2.0/bin/ffmpeg \
+  -rtsp_transport tcp -i rtsp://192.168.1.8:8554/live1 \
+  -an -c:v h264_bm -b:v 2M -g 30 -bf 0 \
+  -f flv rtmp://10.80.40.57:1935/cam_back
+Restart=always
+RestartSec=10
+KillSignal=SIGINT
+TimeoutStopSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
