@@ -157,15 +157,15 @@ ssh linaro@10.80.40.53 'echo linaro | sudo -S systemctl restart sn-monitor-big'
 留在 `/data/soph_SN/deploy/` 只是备份，没有任何作用。
 
 ```bash
-# ① 拷单元（三个可以一次全拷，启用谁看工位）
+# ① 拷单元（四个可以一次全拷，启用谁看工位）
 sudo cp /data/soph_SN/deploy/sn-monitor.service \
- /data/soph_SN/deploy/sn-monitor-big.service \
- /data/soph_SN/deploy/sn-uploader.service /etc/systemd/system/
+        /data/soph_SN/deploy/sn-monitor-big.service \
+        /data/soph_SN/deploy/sn-uploader.service \
+        /data/soph_SN/deploy/sn-preview-ffmpeg.service /etc/systemd/system/
 sudo systemctl daemon-reload
 
-# ② 启用（开机自启 + 立即启动）
-sudo systemctl enable --now sn-monitor-big # 识别（大板工位）。小板工位改用 sn-monitor，二选一！
-sudo systemctl enable --now sn-uploader # 上传 sidecar（可选，见 4.7）
+# ② 一条命令启用全部（识别+上传+WebRTC预览自动跟随）
+sudo systemctl enable --now sn-monitor-big
 ```
 
 | 单元 | 板型 | ExecStart 关键点 | 日志 |
@@ -195,9 +195,9 @@ sudo systemctl enable --now sn-uploader # 上传 sidecar（可选，见 4.7）
  tools/ # 辅助工具（不参与识别主链路，按需运行）
  sn_uploader.py # 命中结果 sidecar：上传 SN+命中帧到 .57 产测系统
  profile_probe.py # 参数扫描工具：新模组快速定档
- deploy/ # systemd 单元（模板，拷到 /etc 用）
- sn-monitor.service / sn-monitor-big.service / sn-uploader.service
- / sn-preview-ffmpeg.service # ★ V4.0 WebRTC 管道
+ deploy/ # systemd 单元（模板，拷到 /etc 用）—— 4 个文件
+    sn-monitor.service / sn-monitor-big.service
+    sn-uploader.service / sn-preview-ffmpeg.service
  docs/ # 分册文档（CHANGELOG + features/ + tools/）
  README.md # 本文档
 
@@ -205,13 +205,13 @@ sudo systemctl enable --now sn-uploader # 上传 sidecar（可选，见 4.7）
  sn_monitor.py / sn_preview_embed.py / sncore/
  sn_uploader.py # ← 仓库在 tools/，板上在根
  preview_service.py + preview_service_README.md # 停用保留
- deploy/ # 三个单元（拷到 /etc 后也没用了，留作对照）
+ deploy/ # 四个单元（拷到 /etc 后留作对照）
  sophon-demo/sample/PP-OCR/ # 官方框架 + models/BM1688/*.bmodel + datasets 字典
  logs/ sn_results/ debug/ # 运行时产物（日志 / 结果 / 漏检留证）
 /etc/systemd/system/sn-monitor.service # ← deploy/ 拷入（小板，单路）
 /etc/systemd/system/sn-monitor-big.service # ← deploy/ 拷入（大板，big 档 + 双路）
 /etc/systemd/system/sn-uploader.service # ← deploy/ 拷入（上传 sidecar）
-/etc/systemd/system/ # ★ V4.0 新增 MediaMTX
+/etc/systemd/system/sn-preview-ffmpeg.service # ★ V4.0 双路 ffmpeg 推流
 /etc/systemd/system/sn-preview-ffmpeg.service # ★ V4.0 新增 ffmpeg 推流
 /opt/mediamtx/mediamtx # ★ V4.0 新增 MediaMTX 二进制 (ARM64, ~28MB)
 ```
@@ -262,11 +262,10 @@ python3 ppocr_system_opencv.py \
 ### 4.1 ★ 一条命令启动全部
 
 ```bash
-# 首次部署：装单元
-sudo cp /data/soph_SN/deploy/sn-monitor-big.service /etc/systemd/system/
-sudo cp /data/soph_SN/deploy/sn-uploader.service /etc/systemd/system/
-sudo cp /data/soph_SN/deploy/sn-preview-ffmpeg.service /etc/systemd/system/
-sudo cp /data/soph_SN/deploy/ /etc/systemd/system/
+# 首次部署：装四个单元
+sudo cp /data/soph_SN/deploy/sn-monitor-big.service \
+        /data/soph_SN/deploy/sn-uploader.service \
+        /data/soph_SN/deploy/sn-preview-ffmpeg.service /etc/systemd/system/
 sudo systemctl daemon-reload
 
 # 一条命令：识别 + 上传 + WebRTC 预览全拉起来
@@ -274,7 +273,7 @@ sudo systemctl enable --now sn-monitor-big
 ```
 
 > 换板型: `disable --now sn-monitor && enable --now sn-monitor-big`。
-> ExecStartPre/ExecStopPost 自动管理 uploader + ffmpeg 推流服务的启停，失败不阻塞识别。
+> ExecStartPre 自动拉起 uploader + ffmpeg 双路推流，ExecStopPost 自动停止，失败不阻塞识别。
 
 ### 4.4 档位系统（V2.0.1 核心）
 
