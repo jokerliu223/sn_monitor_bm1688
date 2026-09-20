@@ -614,8 +614,9 @@ def main():
 
     # v2.1 第二路(背面)只拉流: 复用 FrameReader; 空 --rtsp2 = 双路关(reader2=None, 全程 if reader2 守卫, 单路路径不变)
     reader2 = None
+    reader2_fail = 0
     if args.rtsp2:
-        cap2 = open_verified(args.rtsp2)   # 拉不到不阻塞重试, 直接降级单路(等 camera2 IP 调通再用)
+        cap2 = open_verified(args.rtsp2)
         if cap2 is not None:
             reader2 = FrameReader(); reader2.set_cap(cap2)
             print(f"  第二路(背面): {int(cap2.get(cv2.CAP_PROP_FRAME_WIDTH))}x{int(cap2.get(cv2.CAP_PROP_FRAME_HEIGHT))}")
@@ -721,8 +722,25 @@ def main():
             voted = None; lock_now = False   # 修B:仅report/dup锁板,pending/miss不锁以重试
             last_event = time.time()   # 本次事件, 刷新闲时计时
             recog_ref = frame.copy()   # 记住本次识别的画面, 供同板去抖对比
-            # v2.1: 识别起点顺手抓背面最新帧(与正面 frames[0] 时间最接近, 避免 OCR 耗时后两面不同板); 命中确认时才落盘
-            back_frame = reader2.latest(wait=args.rtsp2_grab_wait)[0] if reader2 else None
+            # v2.1 / V4.0.1: 识别起点顺手抓背面最新帧(与正面 frames[0] 时间最接近)。
+            # V4.0.1: 第二路自愈——检测坏流并重连, 不再永久卡死
+            back_frame = None
+            if reader2:
+                bf, bage, bfail = reader2.latest(wait=args.rtsp2_grab_wait)
+                if bf is not None and bage < args.wedge_age:
+                    back_frame = bf
+                    reader2_fail = 0
+                else:
+                    reader2_fail += 1
+                    if reader2_fail >= args.wedge_fails:
+                        print(f"  ⚠ 第二路坏流确认(帧龄{bage:.1f}s/失败{reader2_fail}), 释放并重连...")
+                        reader2.set_cap(None)
+                        reader2.wait_released(5.0)
+                        cap2 = reconnect(args.rtsp2)
+                        if cap2 is not None:
+                            reader2.set_cap(cap2)
+                            print(f"  ✅ 第二路重连成功")
+                        reader2_fail = 0
             try:
                 eng.load()   # 懒加载: 闲时已释放则此处重加载(常驻时秒回空操作)
                 t0 = time.time()
