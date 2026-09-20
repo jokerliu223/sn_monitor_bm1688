@@ -9,6 +9,7 @@ SE9 / BM1688 算能板用 eth1 接一台路由器/交换机组成小局域网，
 - **调机预览（★ V4.0 WebRTC）**：板子上 `sophon-ffmpeg` 独立拉摄像头**子码流** (`live1`, 768×572 HEVC)，经 BM1688 硬件 H264 编码 (`h264_bm`, <5ms) → RTMP 推流到 **.57 服务器** → `.57` 上的 MediaMTX 转 WebRTC → 前端 `<video>` 实时播放。**不经过识别进程、不占主码流、不重编码为 JPEG。** 延迟 <500ms。
 - **调机预览（V3.0 MJPEG，已废弃）**：识别进程内嵌 JPEG 编码 → MJPEG → `.57` 中继。V4.0 替换，不再使用。
 
+> **V4.0.1 修复**：第二路(背面)摄像头坏流自愈 (reader2 reconnect)。`deploy/` 精简 6→4 文件 (ffmpeg 双路合并)。
 > **V4.0 核心变更**：预览管道从 MJPEG(板子重编码) 换为 WebRTC(子码流直通)，延迟从分钟级降到实时。板子新增两个 ffmpeg 推流服务，`.57` 新增 MediaMTX 协议转换服务。
 > **历史版本（V0.8 → V4.0）逐版说明见 [docs/CHANGELOG.md](docs/CHANGELOG.md)。**
 > 本 README 只讲**当前版本怎么部署、怎么用**。
@@ -34,21 +35,21 @@ SE9 / BM1688 算能板用 eth1 接一台路由器/交换机组成小局域网，
 板子有**两张网卡、两个互不相干的网络**，这是整套部署能同时"拉摄像头"和"上传产测"的前提：
 
 ```
- 公司网 10.80.40.0/24                 相机网 192.168.1.0/24
- 路由器 10.80.40.254                  路由器 / 交换机
-│                                     │
-│ eth0  10.80.40.53                   │ eth1  192.168.1.200
-│                                     │
+ 公司网 10.80.40.0/24 相机网 192.168.1.0/24
+ 路由器 10.80.40.254 路由器 / 交换机
+│ │
+│ eth0 10.80.40.53 │ eth1 192.168.1.200
+│ │
 └────────────┬────────────────────────┘
-             │
+ │
 ┌────────────┴───────┐
-│  SE9 / BM1688 板子 │
+│ SE9 / BM1688 板子 │
 └────────────┬───────┘
-             │
+ │
 ┌────────────┴────────────────────────┐
- eth0: 管理 / 上传                    eth1: 只拉 RTSP 流
- ├─ SSH linaro@10.80.40.53            ├─ 相机1 正面 192.168.1.9
- └─ 上传 .57:8099                     └─ 相机2 背面 192.168.1.8
+ eth0: 管理 / 上传 eth1: 只拉 RTSP 流
+ ├─ SSH linaro@10.80.40.53 ├─ 相机1 正面 192.168.1.9
+ └─ 上传 .57:8099 └─ 相机2 背面 192.168.1.8
 ```
 
 | 网卡 | 地址 | 用途 |
@@ -92,35 +93,34 @@ SE9 / BM1688 算能板用 eth1 接一台路由器/交换机组成小局域网，
 
 ```
 【板子 10.80.40.53】
-  sn-monitor-big.service  识别+上传 (OCR, 不变)
-  ├─ live0 (4K HEVC) → OCR → sn_results/
-  ├─ sn-uploader → POST .57:8099
-  └─ MJPEG :8090 (V3.0, 前端不再使用)
+ sn-monitor-big.service 识别+上传 (OCR, 不变)
+ ├─ live0 (4K HEVC) → OCR → sn_results/
+ ├─ sn-uploader → POST .57:8099
+ └─ MJPEG :8090 (V3.0, 前端不再使用)
 
-  ★ sn-preview-ffmpeg.service  正面预览
-  │  ffmpeg → live1 @ 192.168.1.9:8554 → h264_bm → RTMP → .57:1935/cam_front
-  ★ sn-preview-ffmpeg-back.service  背面预览
-  │  ffmpeg → live1 @ 192.168.1.8:8554 → h264_bm → RTMP → .57:1935/cam_back
-                    │
-                    │ RTMP (TCP, H264 byte stream)
-                    ▼
+ ★ sn-preview-ffmpeg.service 双路预览推流
+ │ ffmpeg → live1 @ 192.168.1.9:8554 → h264_bm → RTMP → .57:1935/cam_front
+ │ ffmpeg → live1 @ 192.168.1.8:8554 → h264_bm → RTMP → .57:1935/cam_back
+ │
+ │ RTMP (TCP, H264 byte stream)
+ ▼
 【.57 10.80.40.57】
-  ★ MediaMTX (start.sh 内置启动, :8889)
-  │  RTMP :1935 ← 板子推流
-  │  WebRTC :8889 WHEP endpoint
-  │  ICE/UDP :8189 媒体传输
-  │  零编码 — 只做 RTMP→WebRTC 协议转换
-  uvicorn :8099
-  ├─ /api/v1/camera/webrtc/config    → 返回配置
-  └─ /api/v1/camera/webrtc/whep/{cam} → WHEP代理 → localhost:8889
-                    │
-                    │ WebRTC (WHEP + UDP/RTP)
-                    ▼
+ ★ MediaMTX (start.sh 内置启动, :8889)
+ │ RTMP :1935 ← 板子推流
+ │ WebRTC :8889 WHEP endpoint
+ │ ICE/UDP :8189 媒体传输
+ │ 零编码 — 只做 RTMP→WebRTC 协议转换
+ uvicorn :8099
+ ├─ /api/v1/camera/webrtc/config → 返回配置
+ └─ /api/v1/camera/webrtc/whep/{cam} → WHEP代理 → localhost:8889
+ │
+ │ WebRTC (WHEP + UDP/RTP)
+ ▼
 【浏览器】
-  CameraPreviewView.vue (纯 WebRTC, 无 MJPEG)
-  ├─ <video> × 2 (front + back)
-  ├─ RTCPeerConnection + WHEP 握手
-  └─ ICE 断线自动重连
+ CameraPreviewView.vue (纯 WebRTC, 无 MJPEG)
+ ├─ <video> × 2 (front + back)
+ ├─ RTCPeerConnection + WHEP 握手
+ └─ ICE 断线自动重连
 ```
 
 | 疑问 | 答案 |
@@ -159,13 +159,13 @@ ssh linaro@10.80.40.53 'echo linaro | sudo -S systemctl restart sn-monitor-big'
 ```bash
 # ① 拷单元（三个可以一次全拷，启用谁看工位）
 sudo cp /data/soph_SN/deploy/sn-monitor.service \
-        /data/soph_SN/deploy/sn-monitor-big.service \
-        /data/soph_SN/deploy/sn-uploader.service /etc/systemd/system/
+ /data/soph_SN/deploy/sn-monitor-big.service \
+ /data/soph_SN/deploy/sn-uploader.service /etc/systemd/system/
 sudo systemctl daemon-reload
 
 # ② 启用（开机自启 + 立即启动）
-sudo systemctl enable --now sn-monitor-big   # 识别（大板工位）。小板工位改用 sn-monitor，二选一！
-sudo systemctl enable --now sn-uploader      # 上传 sidecar（可选，见 4.7）
+sudo systemctl enable --now sn-monitor-big # 识别（大板工位）。小板工位改用 sn-monitor，二选一！
+sudo systemctl enable --now sn-uploader # 上传 sidecar（可选，见 4.7）
 ```
 
 | 单元 | 板型 | ExecStart 关键点 | 日志 |
@@ -176,44 +176,44 @@ sudo systemctl enable --now sn-uploader      # 上传 sidecar（可选，见 4.7
 
 > - 两个 monitor 单元带 `Conflicts=`，**同一路摄像头只能起一个**；enable 其一会自动停另一个。
 > - ⚠️ **装单元会覆盖 `/etc` 里手改过的版本**（比如你手改过摄像头 IP）。改过的工位先备份：
->   `sudo cp /etc/systemd/system/sn-monitor-big.service /etc/systemd/system/sn-monitor-big.service.local_bak`
->   覆盖后务必确认 `ExecStart` 里仍带着需要的 `--rtsp2`。
+> `sudo cp /etc/systemd/system/sn-monitor-big.service /etc/systemd/system/sn-monitor-big.service.local_bak`
+> 覆盖后务必确认 `ExecStart` 里仍带着需要的 `--rtsp2`。
 > - **`deploy/` 里没有 `sn-preview.service`，这是刻意的** —— 旧独立预览服务已停用，不放单元就没人会误启用它。
 
 ### 3.4 目录结构（仓库 vs 板上，路径**按板上实况**取）
 
 ```
 仓库（sn_monitor_bm1688/，git 跟踪 = 可直接部署的代码）
-  sn_monitor.py          # ★ 唯一入口：拉流 + 状态机 + 档位裁剪 + OCR + 投票 + 落库 + 预览
-  sn_preview_embed.py    # ★ V3.0 调机预览模块：被 sn_monitor.py 内嵌 import，共享同一路解码
-  preview_service.py     # V1/V2 独立预览服务，已停用保留
-  preview_service_README.md  # 上面那个脚本自己的 README（停用状态 / 保留接口 / 为什么停）
-  sncore/                # SN 处理内核
-    sn_extract.py        #   SN 提取: 多帧投票 + 格式校验 + 掉字子序列合并
-    result_gate.py       #   结果二次确认门(ResultGate)
-    sn_line.py           #   SN 行版式辅助（历史遗留，当前无任何 import，可忽略）
-  tools/                 # 辅助工具（不参与识别主链路，按需运行）
-    sn_uploader.py       #   命中结果 sidecar：上传 SN+命中帧到 .57 产测系统
-    profile_probe.py     #   参数扫描工具：新模组快速定档
-  deploy/                # systemd 单元（模板，拷到 /etc 用）
-    sn-monitor.service / sn-monitor-big.service / sn-uploader.service
-    mediamtx.service / sn-preview-ffmpeg.service  # ★ V4.0 WebRTC 管道
-  docs/                  # 分册文档（CHANGELOG + features/ + tools/）
-  README.md              # 本文档
+ sn_monitor.py # ★ 唯一入口：拉流 + 状态机 + 档位裁剪 + OCR + 投票 + 落库 + 预览
+ sn_preview_embed.py # ★ V3.0 调机预览模块：被 sn_monitor.py 内嵌 import，共享同一路解码
+ preview_service.py # V1/V2 独立预览服务，已停用保留
+ preview_service_README.md # 上面那个脚本自己的 README（停用状态 / 保留接口 / 为什么停）
+ sncore/ # SN 处理内核
+ sn_extract.py # SN 提取: 多帧投票 + 格式校验 + 掉字子序列合并
+ result_gate.py # 结果二次确认门(ResultGate)
+ sn_line.py # SN 行版式辅助（历史遗留，当前无任何 import，可忽略）
+ tools/ # 辅助工具（不参与识别主链路，按需运行）
+ sn_uploader.py # 命中结果 sidecar：上传 SN+命中帧到 .57 产测系统
+ profile_probe.py # 参数扫描工具：新模组快速定档
+ deploy/ # systemd 单元（模板，拷到 /etc 用）
+ sn-monitor.service / sn-monitor-big.service / sn-uploader.service
+ / sn-preview-ffmpeg.service # ★ V4.0 WebRTC 管道
+ docs/ # 分册文档（CHANGELOG + features/ + tools/）
+ README.md # 本文档
 
 板上运行时（/data/soph_SN/）—— ⚠️ 扁平部署，**没有 tools/ 子目录**
-  sn_monitor.py / sn_preview_embed.py / sncore/
-  sn_uploader.py         # ← 仓库在 tools/，板上在根
-  preview_service.py + preview_service_README.md   # 停用保留
-  deploy/                # 三个单元（拷到 /etc 后也没用了，留作对照）
-  sophon-demo/sample/PP-OCR/   # 官方框架 + models/BM1688/*.bmodel + datasets 字典
-  logs/  sn_results/  debug/   # 运行时产物（日志 / 结果 / 漏检留证）
-/etc/systemd/system/sn-monitor.service       # ← deploy/ 拷入（小板，单路）
-/etc/systemd/system/sn-monitor-big.service   # ← deploy/ 拷入（大板，big 档 + 双路）
-/etc/systemd/system/sn-uploader.service      # ← deploy/ 拷入（上传 sidecar）
-/etc/systemd/system/mediamtx.service         # ★ V4.0 新增 MediaMTX
+ sn_monitor.py / sn_preview_embed.py / sncore/
+ sn_uploader.py # ← 仓库在 tools/，板上在根
+ preview_service.py + preview_service_README.md # 停用保留
+ deploy/ # 三个单元（拷到 /etc 后也没用了，留作对照）
+ sophon-demo/sample/PP-OCR/ # 官方框架 + models/BM1688/*.bmodel + datasets 字典
+ logs/ sn_results/ debug/ # 运行时产物（日志 / 结果 / 漏检留证）
+/etc/systemd/system/sn-monitor.service # ← deploy/ 拷入（小板，单路）
+/etc/systemd/system/sn-monitor-big.service # ← deploy/ 拷入（大板，big 档 + 双路）
+/etc/systemd/system/sn-uploader.service # ← deploy/ 拷入（上传 sidecar）
+/etc/systemd/system/ # ★ V4.0 新增 MediaMTX
 /etc/systemd/system/sn-preview-ffmpeg.service # ★ V4.0 新增 ffmpeg 推流
-/opt/mediamtx/mediamtx                       # ★ V4.0 新增 MediaMTX 二进制 (ARM64, ~28MB)
+/opt/mediamtx/mediamtx # ★ V4.0 新增 MediaMTX 二进制 (ARM64, ~28MB)
 ```
 
 > **`profile_probe.py` 不在板上**（未随部署上板），要用得先 scp 到板子根目录，见 [docs/tools/profile-probe.md](docs/tools/profile-probe.md)。
@@ -240,16 +240,16 @@ echo 'export LD_LIBRARY_PATH=/opt/sophon/sophon-sail/lib/:$LD_LIBRARY_PATH' >> ~
 source ~/.bashrc
 
 # ③ 验证模型已就位
-ls -la models/BM1688/          # 应见 ch_PP-OCRv4_{det,rec}_*_2core.bmodel
+ls -la models/BM1688/ # 应见 ch_PP-OCRv4_{det,rec}_*_2core.bmodel
 
 # ④ 用官方样例图快速验证模型能跑（wiki 第 4 步）
 cd /data/soph_SN/sophon-demo/sample/PP-OCR/python
 python3 ppocr_system_opencv.py \
-    --input=../datasets/train_full_images_0 --batch_size=1 \
-    --bmodel_det=../models/BM1688/ch_PP-OCRv4_det_fp16_2core.bmodel \
-    --bmodel_rec=../models/BM1688/ch_PP-OCRv4_rec_fp16_2core.bmodel \
-    --dev_id=0 --img_size "[[640,48],[320,48]]" \
-    --char_dict_path=../datasets/ppocr_keys_v1.txt
+ --input=../datasets/train_full_images_0 --batch_size=1 \
+ --bmodel_det=../models/BM1688/ch_PP-OCRv4_det_fp16_2core.bmodel \
+ --bmodel_rec=../models/BM1688/ch_PP-OCRv4_rec_fp16_2core.bmodel \
+ --dev_id=0 --img_size "[[640,48],[320,48]]" \
+ --char_dict_path=../datasets/ppocr_keys_v1.txt
 # ⑤ 换 --input=/data/soph_SN/sn_test 可用自己的铭牌图再验一遍
 ```
 
@@ -266,7 +266,7 @@ python3 ppocr_system_opencv.py \
 sudo cp /data/soph_SN/deploy/sn-monitor-big.service /etc/systemd/system/
 sudo cp /data/soph_SN/deploy/sn-uploader.service /etc/systemd/system/
 sudo cp /data/soph_SN/deploy/sn-preview-ffmpeg.service /etc/systemd/system/
-sudo cp /data/soph_SN/deploy/sn-preview-ffmpeg-back.service /etc/systemd/system/
+sudo cp /data/soph_SN/deploy/ /etc/systemd/system/
 sudo systemctl daemon-reload
 
 # 一条命令：识别 + 上传 + WebRTC 预览全拉起来
@@ -329,7 +329,7 @@ sudo systemctl enable --now sn-monitor-big
 |------|--------|------|
 | **上传 sidecar** | `sn_uploader.py` 怎么监视目录、怎么去重、为什么"首次启用会回灌历史"、为什么要 root | [docs/features/uploader.md](docs/features/uploader.md) |
 | **双路摄像头** | 两路为什么"分开拉流不合并"、正反靠时间戳复制配对、`.57` 侧升级要 `ALTER TABLE` | [docs/features/dual-camera.md](docs/features/dual-camera.md) |
-| **调机预览 ★ V4.0 (WebRTC)** | 子码流独立拉流 + `h264_bm` 硬件编码 + MediaMTX 推 WebRTC，延迟 <500ms。部署见下方 4.8 |  |
+| **调机预览 ★ V4.0 (WebRTC)** | 子码流独立拉流 + `h264_bm` 硬件编码 + MediaMTX 推 WebRTC，延迟 <500ms。部署见下方 4.8 | |
 | **参数扫描工具** | 新模组怎么快速定档、`profile_probe.py` 怎么用、输出怎么读 | [docs/tools/profile-probe.md](docs/tools/profile-probe.md) |
 | **版本演进** | V0.8 → V3.0 逐版改了什么、每个坑的根因 | [docs/CHANGELOG.md](docs/CHANGELOG.md) |
 
@@ -340,23 +340,23 @@ new = """### 4.8 ★ V4.0 WebRTC 预览部署
 #### 完整通信流程
 
 ```
-板子 10.80.40.53                              .57 10.80.40.57                    浏览器
+板子 10.80.40.53 .57 10.80.40.57 浏览器
 sn-preview-ffmpeg
-  ffmpeg -i live1                             mediamtx (start.sh)
-   -> h264_bm HW编码 (<5ms)                      RTMP :1935 <- 接收推流
-   -> RTMP push ------------------------------>   WebRTC :8889
-                                                   ICE/UDP :8189
+ ffmpeg -i live1 mediamtx (start.sh)
+ -> h264_bm HW编码 (<5ms) RTMP :1935 <- 接收推流
+ -> RTMP push ------------------------------> WebRTC :8889
+ ICE/UDP :8189
 sn-preview-ffmpeg-back
-  ffmpeg -i live1(.8)                           uvicorn :8099
-   -> h264_bm                                    /webrtc/config
-   -> RTMP push ------------------------------>   /webrtc/whep/{cam} <- 浏览器 POST
-                                                    -> proxy -> localhost:8889
-                                                                               CameraPreviewView.vue
-                                                                                 RTCPeerConnection
-                                                                                 WHEP POST SDP offer
-                                                                                 setRemoteDescription(answer)
-                                                                                 <video> x 2
-                                                                                 ICE disconnect -> auto retry
+ ffmpeg -i live1(.8) uvicorn :8099
+ -> h264_bm /webrtc/config
+ -> RTMP push ------------------------------> /webrtc/whep/{cam} <- 浏览器 POST
+ -> proxy -> localhost:8889
+ CameraPreviewView.vue
+ RTCPeerConnection
+ WHEP POST SDP offer
+ setRemoteDescription(answer)
+ <video> x 2
+ ICE disconnect -> auto retry
 ```
 
 关键设计决策:
@@ -370,7 +370,7 @@ sn-preview-ffmpeg-back
 ```bash
 # 部署 ffmpeg 推流单元
 sudo cp /data/soph_SN/deploy/sn-preview-ffmpeg.service /etc/systemd/system/
-sudo cp /data/soph_SN/deploy/sn-preview-ffmpeg-back.service /etc/systemd/system/
+sudo cp /data/soph_SN/deploy/ /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now sn-preview-ffmpeg sn-preview-ffmpeg-back
 ```
@@ -383,14 +383,14 @@ cd /tmp && wget https://github.com/bluenviron/mediamtx/releases/download/v1.8.0/
 sudo mkdir -p /opt/mediamtx && sudo tar xzf mediamtx_v1.8.0_linux_amd64.tar.gz -C /opt/mediamtx/
 
 # 2) 配置文件: product_test/mediamtx.yml
-#    rtmp: yes, rtmpAddress: :1935
-#    webrtc: yes, webrtcAddress: :8889
-#    srt: no  (避免端口 8000 冲突)
+# rtmp: yes, rtmpAddress: :1935
+# webrtc: yes, webrtcAddress: :8889
+# srt: no (避免端口 8000 冲突)
 
 # 3) 启动: start.sh 已集成
-#    pkill -f mediamtx 2>/dev/null  # 杀旧进程
-#    /opt/mediamtx/mediamtx mediamtx.yml &  # 后台启动
-#    trap "kill $MEDIAMTX_PID" EXIT  # 随 start.sh 退出自动清理
+# pkill -f mediamtx 2>/dev/null # 杀旧进程
+# /opt/mediamtx/mediamtx mediamtx.yml & # 后台启动
+# trap "kill $MEDIAMTX_PID" EXIT # 随 start.sh 退出自动清理
 cd /media/cvitek/xiaohao.liu/product_test
 ./start.sh
 ```
@@ -434,8 +434,8 @@ systemctl is-active sn-preview-ffmpeg sn-preview-ffmpeg-back
 
 ```
 tail -f /data/soph_SN/logs/sn_monitor.service.log
-cat   /data/soph_SN/sn_results/sn_list.txt
-ls    /data/soph_SN/debug/          # 漏检/待确认留证
+cat /data/soph_SN/sn_results/sn_list.txt
+ls /data/soph_SN/debug/ # 漏检/待确认留证
 ```
 
 ---
@@ -448,43 +448,43 @@ ls    /data/soph_SN/debug/          # 漏检/待确认留证
 RTSP 4K/TCP ─► 后台线程持续 read 排空缓冲(只留最新帧)
 │
 ▼
-  主循环 poll(1s) ─► 质量门
-      │ 稳定 + 有铭牌 + 非同板
-      ▼
-  ★抓背面最新帧(V2.1, 见⑪)
-      │
-      ▼
-  按档位裁剪 (+不)切片 ─► 单帧识别 ─► 多帧投票 + 格式校验
-      │
-      ▼
-  二次确认门 ─► 落库(命中则背面帧一并落盘)
-      │
-      ▼
-  (可选) sn-uploader sidecar
-      │
-      ▼
-  POST .57 product_test ─► DB + 前端「SN 抓拍」页
-        正/反按 sn + captured_at 配对成一张卡片
+ 主循环 poll(1s) ─► 质量门
+ │ 稳定 + 有铭牌 + 非同板
+ ▼
+ ★抓背面最新帧(V2.1, 见⑪)
+ │
+ ▼
+ 按档位裁剪 (+不)切片 ─► 单帧识别 ─► 多帧投票 + 格式校验
+ │
+ ▼
+ 二次确认门 ─► 落库(命中则背面帧一并落盘)
+ │
+ ▼
+ (可选) sn-uploader sidecar
+ │
+ ▼
+ POST .57 product_test ─► DB + 前端「SN 抓拍」页
+ 正/反按 sn + captured_at 配对成一张卡片
 ```
 
 **双路时是两条并行的取帧链，只有"抓一帧"这一处交汇**（背面不参与 OCR）：
 
 ```
-RTSP-cam1(正面) ─► FrameReader1 ─► 主循环识别(裁剪/OCR/投票/确认)    ┐
-        └─ 命中时: 把正面 ISO 时间戳                                 │
-           复制给背面(两行 captured_at 相同)                         │
-RTSP-cam2(背面) ─► FrameReader2 ─► 只排空缓冲, 无 OCR                ┘
+RTSP-cam1(正面) ─► FrameReader1 ─► 主循环识别(裁剪/OCR/投票/确认) ┐
+ └─ 命中时: 把正面 ISO 时间戳 │
+ 复制给背面(两行 captured_at 相同) │
+RTSP-cam2(背面) ─► FrameReader2 ─► 只排空缓冲, 无 OCR ┘
 ```
 
 **预览是第三条旁路**（V3.0）：从上面这两条链**已解码的帧**里 `_peek` 取最新帧 → Bmcv 硬件编 JPEG → MJPEG，
 **不新增任何 RTSP 连接**：
 
 ```
-【板子 10.80.40.53】                        【.57 10.80.40.57】        【浏览器】
+【板子 10.80.40.53】 【.57 10.80.40.57】 【浏览器】
 FrameReader1/2 ─ 已解码帧
-   └► _peek(非阻塞, 拿不到就跳过)
-       └► Bmcv 编 JPEG ─► :8090 ──同源中继──► 8099 ─────────────────► 网页
-                          (板子)   /api/v1/camera/*  (产测后端)       <img src=...>
+ └► _peek(非阻塞, 拿不到就跳过)
+ └► Bmcv 编 JPEG ─► :8090 ──同源中继──► 8099 ─────────────────► 网页
+ (板子) /api/v1/camera/* (产测后端) <img src=...>
 ```
 
 > ⚠️ **`:8090` 和 `:8099` 不是同一个服务，也不在同一台机器上**：

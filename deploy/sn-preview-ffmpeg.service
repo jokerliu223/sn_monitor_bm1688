@@ -1,24 +1,30 @@
 [Unit]
-Description=SN preview ffmpeg push (camera sub-stream -> MediaMTX)
+Description=SN preview ffmpeg push (dual sub-stream -> MediaMTX)
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
 User=root
-# 主码流 live0 (4K HEVC) → HW decoder → scale 1080p → HW H264 → RTMP → .57
-# 与识别(live0)共享同一码流——相机支持多客户端同时拉
-ExecStart=/opt/sophon/sophon-ffmpeg_2.2.0/bin/ffmpeg \
-  -rtsp_transport tcp -i rtsp://192.168.1.9:8554/live1 \
-  -an -c:v h264_bm -b:v 2M -g 30 -bf 0 \
-  -f flv rtmp://10.80.40.57:1935/cam_front
+# 正面子码流(.9) + 背面子码流(.8) 同时在板内推流
+# h264_bm only works with BM1688 HW decoder output (no pipe:0)
+ExecStart=/bin/bash -c 'set -m; \
+  /opt/sophon/sophon-ffmpeg_2.2.0/bin/ffmpeg \
+    -rtsp_transport tcp -i rtsp://192.168.1.9:8554/live1 \
+    -an -c:v h264_bm -b:v 2M -g 30 -bf 0 \
+    -f flv rtmp://10.80.40.57:1935/cam_front & \
+  /opt/sophon/sophon-ffmpeg_2.2.0/bin/ffmpeg \
+    -rtsp_transport tcp -i rtsp://192.168.1.8:8554/live1 \
+    -an -c:v h264_bm -b:v 2M -g 30 -bf 0 \
+    -f flv rtmp://10.80.40.57:1935/cam_back & \
+  wait'
 Restart=always
 RestartSec=10
 KillSignal=SIGINT
-TimeoutStopSec=10
+TimeoutStopSec=15
 StandardOutput=journal
 StandardError=journal
 
 [Install]
-# ★ V3.0.1: enable monitor 时自动 enable 本单元（仍可单独 enable / disable）
+# enable monitor 时自动 enable 本单元
 WantedBy=sn-monitor.service sn-monitor-big.service multi-user.target

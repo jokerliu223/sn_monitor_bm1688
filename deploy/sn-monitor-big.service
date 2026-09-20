@@ -17,7 +17,6 @@ ExecStart=/usr/bin/python3 /data/soph_SN/sn_monitor.py --rtsp rtsp://192.168.1.9
 # ★ V3.0.1: start 前确保 uploader + ffmpeg 推流在跑（'-' = 失败不阻塞识别）
 ExecStartPre=-/usr/bin/systemctl start sn-uploader
 ExecStartPre=-/usr/bin/systemctl start sn-preview-ffmpeg
-ExecStartPre=-/usr/bin/systemctl start sn-preview-ffmpeg-back
 Restart=always
 RestartSec=5
 # stop 时发 SIGINT -> 干净退出(release 发 TEARDOWN)
@@ -26,7 +25,6 @@ TimeoutStopSec=15
 # ★ V3.0.1: stop/restart 时自动停 uploader + ffmpeg 推流
 ExecStopPost=-/usr/bin/systemctl stop sn-uploader
 ExecStopPost=-/usr/bin/systemctl stop sn-preview-ffmpeg
-ExecStopPost=-/usr/bin/systemctl stop sn-preview-ffmpeg-back
 StandardOutput=append:/data/soph_SN/logs/sn_monitor.service.log
 StandardError=append:/data/soph_SN/logs/sn_monitor.service.log
 
