@@ -6,6 +6,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=root
+# 子码流 live1 → HW decoder → HW H264 → RTMP → .57
 ExecStart=/opt/sophon/sophon-ffmpeg_2.2.0/bin/ffmpeg \
   -rtsp_transport tcp -i rtsp://192.168.1.8:8554/live1 \
   -an -c:v h264_bm -b:v 2M -g 30 -bf 0 \

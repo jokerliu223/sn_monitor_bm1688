@@ -6,9 +6,8 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=root
-# h264_bm only works with BM1688 HW decoder output:
-#   -i rtsp://... -> HW decoder -> BM-native frames -> h264_bm OK
-#   pipe:0 rawvideo -> swscale -> h264_bm FAILS (Invalid pic data)
+# 主码流 live0 (4K HEVC) → HW decoder → scale 1080p → HW H264 → RTMP → .57
+# 与识别(live0)共享同一码流——相机支持多客户端同时拉
 ExecStart=/opt/sophon/sophon-ffmpeg_2.2.0/bin/ffmpeg \
   -rtsp_transport tcp -i rtsp://192.168.1.9:8554/live1 \
   -an -c:v h264_bm -b:v 2M -g 30 -bf 0 \
