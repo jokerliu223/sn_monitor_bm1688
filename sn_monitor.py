@@ -39,7 +39,9 @@ CHAR_DICT = "../datasets/ppocr_keys_v1.txt"
 DEV_ID = 0
 RESULTS_DIR = "/data/soph_SN/sn_results"
 DEBUG_DIR = "/data/soph_SN/debug"    # 漏检/待确认帧留证目录(证据驱动调参)
-WEDGE_FAILS = 8     # 连续读失败达此次数即判坏流, 立即受控release+重连拿干净流(可--wedge-fails调)
+WEDGE_FAILS = 3     # 连续读失败达此次数即判坏流, 立即受控release+重连拿干净流(可--wedge-fails调)
+                    # 2026-09-22 由 8 降为 3: 10s 检查周期下 3 次≈30s 就能发现故障;
+                    # 背面图"多抓一张 vs 挂了不管", 误判重连的代价远小于长期静默。
 
 SN_REGEX = re.compile(r'^[A-Z0-9]{12,20}$')
 SN_PREFIX = [r'SN[:\s\-]*([A-Z0-9]{6,20})', r'S/N[:\s\-]*([A-Z0-9]{6,20})']
@@ -676,6 +678,127 @@ def reconnect(rtsp, probe_gap=3, alert_after=5):
         time.sleep(probe_gap)
     return None
 
+def reconnect_bounded(rtsp, max_tries=3, probe_gap=5, verify_wait=0.0):
+    """有界重连: 最多试 max_tries 轮(每轮先探活, 通了才开流), 用尽返回 None。
+
+    为什么必须有界: 运行期绝不能让一个源拖死整个主循环 —— 现场故障里
+    .8 摄像头掉线后, 无限循环的 reconnect() 把识别主循环永久卡在 06:20:29,
+    正面 SN 识别与抓拍一起停摆 3 小时以上且完全静默。宁可降级为单路,
+    也不能整机停摆。返回 None 由调用方转入低频后台重探。
+
+    verify_wait: 每轮之间的额外等待; 后台重探传 0 以免拖慢主循环。
+    """
+    for _ in range(max_tries):
+        if STOP:
+            return None
+        if source_up(rtsp):
+            cap = open_verified(rtsp)        # 校验活流(挡 0x0 半死流)
+            if cap is not None:
+                print("  ✅ 重连成功")
+                reset_decode_errs(); mark_reconnect()
+                return cap
+        if probe_gap > 0:
+            time.sleep(probe_gap)
+    return None
+
+
+# ===== 长稳韧性: 背面链路健康检查与有界自愈 =====
+# 现场故障复盘: 背面(.8)健康检查原先嵌在"SN 命中"分支内, 工位静置 12 小时
+# 一个板都没放, 于是检查一次都没跑 —— 摄像头挂了 3 小时 43 分系统零感知、
+# 零日志。检查必须独立于识别事件; 恢复必须低频、非阻塞, 且失败不拖累主循环。
+
+def back_health_tick(reader, min_interval=10.0, wedge_age=3.0):
+    """背面链路健康检查: 独立于识别事件, 静置期也在主循环里周期跑。
+
+    返回 (need_recover, stale_age)。need_recover=True 表示这一路已经
+    连续多次取不到新鲜帧, 该交给 probe_and_recover 去重连。
+    只做非阻塞 peek, 绝不在这里开流 —— 开流的代价由调用方节流。
+    """
+    now = time.time()
+    if now - back_health_tick.last < min_interval:      # 节流: 别每轮都查
+        return False, 0.0
+    back_health_tick.last = now
+    if reader is None:
+        return False, 0.0
+    _, age, _ = reader.latest(wait=0.0)                 # 非阻塞 peek 帧龄
+    stale = reader.frame is None or age > wedge_age
+    if not stale:
+        back_health_tick.fails = 0
+        return False, 0.0
+    back_health_tick.fails += 1
+    return True, age
+back_health_tick.last = 0.0
+back_health_tick.fails = 0
+
+
+def probe_and_recover(reader, rtsp, min_interval=30.0, wedge_fails=3):
+    """背面恢复: 低频、有界、非阻塞。
+
+    先纯 TCP 探活(source_up, ~0s), 源真回来了才付"开流"的代价。
+    无论成功失败都在有界时间内返回, 绝不把主循环拖住。
+    返回 True 表示这一路当前不可用(供状态外显用)。
+    """
+    now = time.time()
+    if now - probe_and_recover.last < min_interval:     # 节流: 低频重探
+        return probe_and_recover.offline
+    probe_and_recover.last = now
+
+    if not source_up(rtsp, timeout=1.0):
+        # ★ 每次都出声: 原先只在第 alert_after 次印一次, 之后进入静默空转,
+        #   现场因此出现 1.5 小时无任何输出的"看不出还在不在跑"。
+        print(f"  · 背面链路离线(低频重探中, 每{min_interval:.0f}s一次) —— 源端口未监听")
+        probe_and_recover.offline = True
+        return True
+
+    cap = reconnect_bounded(rtsp, max_tries=1, probe_gap=0)
+    if cap is None:
+        print(f"  · 背面源端口在监听但开流失败(可能仍无码流), 下轮再试")
+        probe_and_recover.offline = True
+        return True
+    reader.set_cap(cap)
+    print("  ✅ 背面链路已恢复")
+    probe_and_recover.offline = False
+    return False
+probe_and_recover.last = 0.0
+probe_and_recover.offline = False
+
+
+def start_loop_watchdog(beat, threshold=60.0, interval=10.0, on_alert=None):
+    """主循环看门狗: 兜住任何"未知阻塞"。
+
+    P1/P2 修的是已知阻塞点(背面健康检查、reconnect); 看门狗保证将来
+    任何没预料到的阻塞都不会再变成"静默几小时"。
+
+    ★ 只告警, 不杀进程 —— 识别本身可能因大板/小板慢而合法地占数十秒,
+      自动重启有误伤风险。先确保"一定会被看见", 由人工判断。
+    beat: 一个带 .t 属性的对象或 {'t': float} 字典, 主循环每轮末更新。
+    """
+    def _get():
+        return beat["t"] if isinstance(beat, dict) else beat.t
+
+    def _watch():
+        alerted = False
+        while not STOP:
+            time.sleep(interval)
+            gap = time.time() - _get()
+            if gap > threshold:
+                msg = (f"  ⚠⚠ 主循环停滞 {gap:.0f}s 未推进(阈值{threshold:.0f}s)"
+                       f" —— 疑似新阻塞点, 请查日志定位")
+                print(msg)
+                if on_alert:
+                    try:
+                        on_alert(msg)
+                    except Exception:            # noqa: BLE001
+                        pass
+                alerted = True
+            elif alerted:
+                print(f"  ✅ 主循环已恢复推进(停滞结束)")
+                alerted = False
+
+    t = threading.Thread(target=_watch, name="loop-watchdog", daemon=True)
+    t.start()
+    return lambda: None        # 守护线程随进程退出, 无需显式停
+
 def main():
     p = argparse.ArgumentParser(description="SN v10")
     p.add_argument("--rtsp", required=True)
@@ -694,8 +817,19 @@ def main():
     p.add_argument("--idle", type=float, default=600)
     p.add_argument("--ocr-idle-unload", type=float, default=30.0, dest="ocr_idle_unload",
                    help="模型闲时释放: 距上次识别超此秒数释放模型省NPU, 下块板懒加载。0=永不释放(常驻)")
-    p.add_argument("--wedge-fails", type=int, default=WEDGE_FAILS, dest="wedge_fails",
-          help="连续无新鲜帧达此次数即判坏流并立即release+重连(默认8, 越小越快自愈)")
+    p.add_argument("--wedge-fails", type=int, default=3, dest="wedge_fails",
+          help="连续无新鲜帧达此次数即判坏流并立即release+重连(默认3≈30s发现; 旧值8过保守)")
+    # ★ 韧性三件套(P1/P2/P5): 防"一个源拖死主循环"、防"静置期失明"
+    p.add_argument("--start-reconnect-tries", type=int, default=3, dest="start_reconnect_tries",
+          help="启动期正面源不可达时的有界重连轮数, 用尽则退出交 systemd 重试(默认3)")
+    p.add_argument("--back-reconnect-tries", type=int, default=3, dest="back_reconnect_tries",
+          help="运行期(正面/背面)单次有界重连轮数, 用尽后回主循环下轮再试(默认3)")
+    p.add_argument("--back-reprobe-interval", type=float, default=30.0, dest="back_reprobe_interval",
+          help="背面离线后的低频重探间隔(秒); 只做 TCP 探活, 通了才开流(默认30)")
+    p.add_argument("--back-check-interval", type=float, default=10.0, dest="back_check_interval",
+          help="背面健康检查周期(秒), 独立于识别事件, 静置期也跑(默认10; 0=关闭)")
+    p.add_argument("--loop-watchdog", type=float, default=60.0, dest="loop_watchdog",
+          help="主循环停滞告警阈值(秒), 只告警不杀进程(默认60; 0=关闭)")
     p.add_argument("--wedge-age", type=float, default=3.0, dest="wedge_age",
  help="帧龄超此秒数判无新鲜帧(后台线程排不出新帧=流卡死), 触发重连(默认3s)")
     p.add_argument("--wedge-dead-s", type=float, default=25.0, dest="wedge_dead_s",
@@ -798,26 +932,16 @@ def main():
     state = "empty"; settle = False; place_tries = 0   # 状态机: empty=空场; settle=待稳定判场景; place_tries=同一在位板已重识次数
     mark_reconnect()
 
-    cap = open_verified(args.rtsp)       # 校验活流, 挡 0x0 半死流
-    if cap is None:
-        print("首次打开失败/坏流, 进入重连等待源(摄像头推流起来后自动接上)...")
-        cap = reconnect(args.rtsp)
-        if cap is None:
-            print("[退出]"); return
-    print(f"  流: {int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))}x{int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))}")
+    # ★ 顺序很关键: 先把 FrameReader 建出来并**挂上预览**, 再去开流。
+    #   现场故障复盘: attach() 原先排在初始 reconnect() 之后, 源不通时进程卡在
+    #   建流处, 永远走不到 attach -> :8090 不监听 -> 前端拿不到状态、连"离线"
+    #   都显示不出来。改成"先起预览线程, 后接流": 源好不好都能上报状态。
     reader = FrameReader("front")          # 后台线程持续排空缓冲, 主循环只取最新帧
-    reader.set_cap(cap)
 
     # v2.1 第二路(背面)只拉流: 复用 FrameReader; 空 --rtsp2 = 双路关(reader2=None, 全程 if reader2 守卫, 单路路径不变)
     reader2 = None
-    reader2_fail = 0
     if args.rtsp2:
-        cap2 = open_verified(args.rtsp2)
-        if cap2 is not None:
-            reader2 = FrameReader("back"); reader2.set_cap(cap2)
-            print(f"  第二路(背面): {int(cap2.get(cv2.CAP_PROP_FRAME_WIDTH))}x{int(cap2.get(cv2.CAP_PROP_FRAME_HEIGHT))}")
-        else:
-            print(f"  ⚠ 第二路 {args.rtsp2} 暂不可达, 本次降级为单路(仅正面), 背面抓拍跳过")
+        reader2 = FrameReader("back")      # 先挂空, 由下面的低频重探/启动开流补上
 
     print("\n[监控启动]\n")
 
@@ -831,8 +955,41 @@ def main():
             port=args.preview_port, fps=args.preview_fps, res=args.preview_res,
             preview=_pv_cam, jpeg_quality=args.preview_jpeg_quality)
 
+    # 正面(识别路): 冷启动允许短等待, 但有界 —— 源不通就退出, 不无限挂着。
+    # 旧行为(reconnect 无限循环)会让服务在源缺失时永久卡在启动期, 连预览端口都起不来。
+    cap = open_verified(args.rtsp)       # 校验活流, 挡 0x0 半死流
+    if cap is None:
+        print("首次打开失败/坏流, 有界重连等待源...")
+        cap = reconnect_bounded(args.rtsp, max_tries=args.start_reconnect_tries,
+                                probe_gap=args.back_reprobe_interval)
+    if cap is None:
+        print("[退出] 正面源不可达且重连用尽 —— 由 systemd 按 Restart=always 重试"
+              "(预览端口已在监听, 可从前端看到离线状态)")
+        reader.run = False
+        if reader2:
+            reader2.run = False
+        preview_stop()
+        return
+    print(f"  流: {int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))}x{int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))}")
+    reader.set_cap(cap)
+
+    if reader2 is not None:
+        cap2 = open_verified(args.rtsp2)
+        if cap2 is not None:
+            reader2.set_cap(cap2)
+            print(f"  第二路(背面): {int(cap2.get(cv2.CAP_PROP_FRAME_WIDTH))}x{int(cap2.get(cv2.CAP_PROP_FRAME_HEIGHT))}")
+        else:
+            # ★ 不再"降级为单路就再也不管": 保留 reader2, 由主循环的低频重探自动接上。
+            #   旧行为下这一路此后永久失明, 现场正是这么挂掉 3 小时无感知的。
+            print(f"  ⚠ 第二路 {args.rtsp2} 暂不可达 —— 保留背面通道, 由低频重探自动接上")
+
+    # P5: 主循环看门狗 —— 兜住将来任何未知阻塞, 只告警不杀进程
+    _beat = {"t": time.time()}
+    start_loop_watchdog(_beat, threshold=args.loop_watchdog, interval=10.0)
+
     try:
         while not STOP:
+            _beat["t"] = time.time()      # 每轮标记推进, 供看门狗判停滞
             if args.idle > 0 and time.time()-idle_t > args.idle:
                 print(f"\n[超时]"); break   # 常驻服务传 --idle 0 表示永不超时
 
@@ -864,13 +1021,22 @@ def main():
                         print(f"  无新鲜帧(帧龄{age:.1f}s/线程失败{rfail}) {diag}, 快速等待自愈...")
                     time.sleep(0.3)
                     continue
-                # 真坏流: 无解码活动持续无帧, 或超死线仍无帧 -> release+重连(reconnect内探端口)
+                # 真坏流: 无解码活动持续无帧, 或超死线仍无帧 -> release+有界重连
+                # ★ 关键: 用 reconnect_bounded 而非无限循环的 reconnect —— 源回不来时
+                #   必须让主循环继续转(背面检查/看门狗/状态行都靠它), 而不是整机停摆。
                 print(f"  ⚠ 坏流确认(帧龄{age:.1f}s/失败{fail}/解码错{active_errs}) {diag}, 释放并重连...")
                 reader.set_cap(None)
                 reader.wait_released(6.0)
-                cap = reconnect(args.rtsp)
+                cap = reconnect_bounded(args.rtsp, max_tries=args.back_reconnect_tries,
+                                        probe_gap=args.back_reprobe_interval)
                 if cap is None:
-                    break
+                    # 正面暂不可用: 不清空 reader, 留在原地由下一轮继续尝试有界重连。
+                    # 旧行为这里 break 直接退出进程, 服务靠 systemd 拉起 —— 但那样
+                    # 预览端口每次都要重起, 前端会看到画面反复中断。
+                    print(f"  ⚠ 正面源本轮重连未成功, 继续监控(下轮再试, 不退出)")
+                    fail = 0
+                    time.sleep(1.0)
+                    continue
                 reader.set_cap(cap)
                 fail = 0
                 _recvq_reset()
@@ -878,6 +1044,27 @@ def main():
                 continue
             fail = 0
             mon += 1
+            # ★ P1: 背面链路健康检查, 与识别事件完全解耦 —— 静置期(无人放板)也在跑。
+            #   现场故障复盘: 原先这段嵌在"SN 命中"分支里, 工位静置 12 小时一个板都没放,
+            #   检查一次都没执行 -> .8 挂了 3h43m 系统零感知、零日志。
+            back_offline = False
+            if reader2 is not None:
+                need, bage = back_health_tick(
+                    reader2, min_interval=args.back_check_interval, wedge_age=args.wedge_age)
+                if need and back_health_tick.fails >= args.wedge_fails:
+                    # 连续多次取不到新鲜帧 -> 交给低频重探(有界、非阻塞)
+                    print(f"  ⚠ 背面链路异常(帧龄{bage:.1f}s/连续{back_health_tick.fails}次), 转入低频重探...")
+                    reader2.set_cap(None)
+                    reader2.wait_released(3.0)
+                    back_health_tick.fails = 0
+                back_offline = probe_and_recover(
+                    reader2, args.rtsp2,
+                    min_interval=args.back_reprobe_interval, wedge_fails=args.wedge_fails)
+            # 背面离线心跳: 每 30s 一条, 保证"静置期也能从日志看出链路状态"
+            if reader2 is not None and mon % 30 == 0:
+                _, _bage, _ = reader2.latest(wait=0.0)
+                _state = "离线(重探中)" if back_offline else f"正常(帧龄{_bage:.1f}s)"
+                print(f"  [背面链路] {_state}")
             # 周期状态行(观测): 每 100 次监控记一行健康快照, 有病时能看出是从哪一刻开始退化的
             if mon % 100 == 0:
                 rq, rqn = _probe_cached(reader)
@@ -936,24 +1123,14 @@ def main():
             last_event = time.time()   # 本次事件, 刷新闲时计时
             recog_ref = frame.copy()   # 记住本次识别的画面, 供同板去抖对比
             # v2.1 / V4.0.1: 识别起点顺手抓背面最新帧(与正面 frames[0] 时间最接近)。
-            # V4.0.1: 第二路自愈——检测坏流并重连, 不再永久卡死
+            # ★ 这里只负责"取帧", 不再负责"治病": 健康检查/重连已上移到主循环每轮
+            #   (见 back_health_tick + probe_and_recover)。原先在命中分支里 reconnect(),
+            #   对已垂死的单客户端源再补一刀, 且源不回就永久阻塞 —— 正是现场 3h43m 卡死的成因。
             back_frame = None
             if reader2:
-                bf, bage, bfail = reader2.latest(wait=args.rtsp2_grab_wait)
+                bf, bage, _ = reader2.latest(wait=args.rtsp2_grab_wait)
                 if bf is not None and bage < args.wedge_age:
                     back_frame = bf
-                    reader2_fail = 0
-                else:
-                    reader2_fail += 1
-                    if reader2_fail >= args.wedge_fails:
-                        print(f"  ⚠ 第二路坏流确认(帧龄{bage:.1f}s/失败{reader2_fail}), 释放并重连...")
-                        reader2.set_cap(None)
-                        reader2.wait_released(5.0)
-                        cap2 = reconnect(args.rtsp2)
-                        if cap2 is not None:
-                            reader2.set_cap(cap2)
-                            print(f"  ✅ 第二路重连成功")
-                        reader2_fail = 0
             try:
                 eng.load()   # 懒加载: 闲时已释放则此处重加载(常驻时秒回空操作)
                 t0 = time.time()
