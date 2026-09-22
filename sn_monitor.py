@@ -412,6 +412,7 @@ class FrameReader:
             self.frame = None
             self.ts = 0.0
             self.fail = 0
+            self._cap_t = time.time()   # 健康检查的宽限期起点(新挂 cap 首帧未到属正常过渡)
             if cap is None:
                 self._released.clear()
     def _loop(self):
@@ -471,6 +472,19 @@ class FrameReader:
             time.sleep(0.02)
         with self.lock:
             return None, 0.0, self.fail
+    def last_age(self):
+        """距最后一张成功帧的真实时长(秒); **从未有过帧返回 None**。
+
+        为什么单开一个方法: latest() 在取不到帧时返回的 age 是占位值 0.0,
+        那是"没测到"而不是"帧很新"。健康检查若直接拿它比阈值, 就会把
+        "当前无帧"误当成"正常", 又或者在刚挂上 cap、首帧还没到的窗口里
+        反复判异常 -> 把刚接上的流再次掐掉, 永远接不上。宁可显式区分三态:
+        有帧(返回秒数) / 从未有帧(None) / 帧太旧(返回大秒数)。
+        """
+        with self.lock:
+            if self.frame is None:
+                return None
+            return time.time() - self.ts
     def wait_released(self, timeout=6.0):
         """等线程放开并 release 旧 cap(重连前调用, 保证单客户端源可接新连接)。"""
         self._released.wait(timeout)
@@ -713,12 +727,18 @@ def reconnect_bounded(rtsp, max_tries=3, probe_gap=5, verify_wait=0.0, max_secs=
 # 一个板都没放, 于是检查一次都没跑 —— 摄像头挂了 3 小时 43 分系统零感知、
 # 零日志。检查必须独立于识别事件; 恢复必须低频、非阻塞, 且失败不拖累主循环。
 
-def back_health_tick(reader, min_interval=10.0, wedge_age=3.0):
+def back_health_tick(reader, min_interval=10.0, wedge_age=3.0, grace=15.0):
     """背面链路健康检查: 独立于识别事件, 静置期也在主循环里周期跑。
 
     返回 (need_recover, stale_age)。need_recover=True 表示这一路已经
     连续多次取不到新鲜帧, 该交给 probe_and_recover 去重连。
     只做非阻塞 peek, 绝不在这里开流 —— 开流的代价由调用方节流。
+
+    ★ 三态判断, 不能拿 latest() 的 age 直接比阈值:
+      - 有帧且新        -> 健康
+      - 有帧但太旧      -> 异常计数 +1
+      - 从未有过帧      -> 刚挂上 cap / 源还没出流, 给 grace 秒宽限期,
+                           期内不算异常(否则会把刚接上的流立刻再掐掉)
     """
     now = time.time()
     if now - back_health_tick.last < min_interval:      # 节流: 别每轮都查
@@ -726,24 +746,41 @@ def back_health_tick(reader, min_interval=10.0, wedge_age=3.0):
     back_health_tick.last = now
     if reader is None:
         return False, 0.0
-    _, age, _ = reader.latest(wait=0.0)                 # 非阻塞 peek 帧龄
-    stale = reader.frame is None or age > wedge_age
-    if not stale:
+    age = reader.last_age()                             # 非阻塞; 从未有帧 = None
+    if age is None:
+        # 刚 set_cap 的 reader 还没有首帧, 属于正常过渡期, 给它时间出流
+        if now - getattr(reader, "_cap_t", now) < grace:
+            return False, 0.0
+        stale_age = -1.0                                # 超宽限仍无帧 = 真的没流
+    elif age <= wedge_age:
         back_health_tick.fails = 0
         return False, 0.0
+    else:
+        stale_age = age
     back_health_tick.fails += 1
-    return True, age
+    return True, stale_age
 back_health_tick.last = 0.0
 back_health_tick.fails = 0
 
 
-def probe_and_recover(reader, rtsp, min_interval=30.0, wedge_fails=3):
+def probe_and_recover(reader, rtsp, min_interval=30.0, wedge_fails=3, wedge_age=3.0):
     """背面恢复: 低频、有界、非阻塞。
 
     先纯 TCP 探活(source_up, ~0s), 源真回来了才付"开流"的代价。
     无论成功失败都在有界时间内返回, 绝不把主循环拖住。
     返回 True 表示这一路当前不可用(供状态外显用)。
+
+    ★ 前置守卫: 链路已经健康时立刻返回, 绝不碰流。
+      否则这个函数每 30s 都会再开一条新流盖掉正在正常工作的那条 ——
+      对"单客户端"相机源尤其危险(见 rtsp-camera-udp-teardown: 旧连接没
+      TEARDOWN 干净, 新连接拉不起来)。恢复动作只在真离线时才允许发生。
     """
+    # 已经能持续拿到新鲜帧 -> 无需恢复, 也不该打断
+    age = reader.last_age()
+    if age is not None and age <= wedge_age:
+        probe_and_recover.offline = False
+        return False
+
     now = time.time()
     if now - probe_and_recover.last < min_interval:     # 节流: 低频重探
         return probe_and_recover.offline
@@ -1069,18 +1106,26 @@ def main():
                 need, bage = back_health_tick(
                     reader2, min_interval=args.back_check_interval, wedge_age=args.wedge_age)
                 if need and back_health_tick.fails >= args.wedge_fails:
-                    # 连续多次取不到新鲜帧 -> 交给低频重探(有界、非阻塞)
-                    print(f"  ⚠ 背面链路异常(帧龄{bage:.1f}s/连续{back_health_tick.fails}次), 转入低频重探...")
-                    reader2.set_cap(None)
-                    reader2.wait_released(3.0)
+                    # 连续多次取不到新鲜帧 -> 交给低频重探(有界、非阻塞)。
+                    # 用 last_age() 报真实帧龄: latest() 在无帧时给的是占位 0.0,
+                    # 照抄到日志里会印出"帧龄0.0s 却判异常"这种自相矛盾的记录。
+                    _la = reader2.last_age()
+                    _desc = "从未出帧" if _la is None else f"帧龄{_la:.1f}s"
+                    print(f"  ⚠ 背面链路异常({_desc}/连续{back_health_tick.fails}次), 转入低频重探...")
                     back_health_tick.fails = 0
+                # ★ 每次主循环都调, 由函数内部按 min_interval 节流 —— 它自己负责
+                #   "探活->开流->set_cap", 健康检查只负责报"该重探了", 不在这里多手 set_cap,
+                #   否则刚接上的流会被下一轮再次清掉, 永远接不上。
                 back_offline = probe_and_recover(
                     reader2, args.rtsp2,
-                    min_interval=args.back_reprobe_interval, wedge_fails=args.wedge_fails)
+                    min_interval=args.back_reprobe_interval,
+                    wedge_fails=args.wedge_fails,
+                    wedge_age=args.wedge_age)
             # 背面离线心跳: 每 30s 一条, 保证"静置期也能从日志看出链路状态"
             if reader2 is not None and mon % 30 == 0:
-                _, _bage, _ = reader2.latest(wait=0.0)
-                _state = "离线(重探中)" if back_offline else f"正常(帧龄{_bage:.1f}s)"
+                _la = reader2.last_age()
+                _state = "离线(重探中)" if back_offline else (
+                    "无帧" if _la is None else f"正常(帧龄{_la:.1f}s)")
                 print(f"  [背面链路] {_state}")
             # 周期状态行(观测): 每 100 次监控记一行健康快照, 有病时能看出是从哪一刻开始退化的
             if mon % 100 == 0:
