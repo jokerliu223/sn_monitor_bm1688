@@ -77,11 +77,57 @@ def _stderr_pump(read_fd):
             # 按行回显: 丢弃已知刷屏坏包行(_DROP_PATS), 其余透传到真 stderr
             if _real_stderr_fd is not None and not any(p in line for p in _DROP_PATS):
                 try:
-                    os.write(_real_stderr_fd, line + b"\n")
+                    os.write(_real_stderr_fd, _ts() + b" " + line + b"\n")
                 except OSError:
                     pass
         if len(buf) > 65536:
             buf = buf[-4096:]
+
+
+# ===== 日志时间戳: 排查"流什么时候卡的"必须有时间轴, 否则只能靠重启点反推 =====
+def _ts():
+    return datetime.now().strftime("[%H:%M:%S.%f")[:-3].encode() + b"]"
+
+class _TeeWriter:
+    """给 print/stderr 每行加 [HH:MM:SS.mmm] 前缀。逐块透传, 只改写真实行首,
+    避免半行被割裂时误插时间戳。原流保持原样(append 文件 + journal)。"""
+    def __init__(self, raw):
+        self.raw = raw
+        self._at_line_start = True
+
+    def write(self, s):
+        if isinstance(s, bytes):
+            self.raw.buffer.write(s); self.raw.flush(); return len(s)
+        if not s:
+            return 0
+        out = []
+        for seg in s.splitlines(keepends=True):
+            if self._at_line_start and seg.strip():
+                out.append(_ts().decode() + " " + seg)
+            else:
+                out.append(seg)
+            self._at_line_start = seg.endswith(("\n", "\r"))
+        if s and not s.endswith(("\n", "\r")):
+            self._at_line_start = False
+        self.raw.write("".join(out))
+        self.raw.flush()
+        return len(s)
+
+    def flush(self):
+        try: self.raw.flush()
+        except Exception: pass
+
+    def isatty(self): return False
+    def fileno(self): return self.raw.fileno()
+
+def start_log_timestamp():
+    """在 stderr 劫持与 fd 复制之后调用, 否则会和 _stderr_pump 抢 fd。"""
+    try:
+        sys.stdout.flush()
+        sys.stdout = _TeeWriter(sys.stdout)
+        print("[日志] 已启用时间戳")
+    except Exception as e:
+        print(f"  (日志时间戳启用失败, 降级: {e})")
 
 def start_stderr_monitor():
     global _real_stderr_fd
@@ -338,7 +384,8 @@ class FrameReader:
     """后台线程持续 read() 排空解码缓冲, 只留最新帧。主循环 latest() 永远拿最新解码帧,
     根治 FFMPEG 缓冲的旧帧回放(BUFFERSIZE=1 对 FFMPEG 后端无效)。cap 的 read/release 全由
     本线程做, set_cap 交接, 循环顶安全 release, 杜绝跨线程释放崩溃。"""
-    def __init__(self):
+    def __init__(self, name="front"):
+        self.name = name
         self._cur = None
         self._new = None
         self._has_new = False
@@ -348,6 +395,13 @@ class FrameReader:
         self.lock = threading.Lock()
         self.run = True
         self._released = threading.Event()
+        # ===== 观测(A方案): 区分"源死了" vs "流活着但我读得慢" =====
+        # 读出帧数按秒计数 -> 健康时应≈码流帧率(25). 掉到 0 且 Recv-Q 在涨 = 读线程被卡住.
+        self._win_t = time.time()
+        self._win_n = 0
+        self.rate = 0.0          # 解码出帧速率(帧/秒), 每秒刷新
+        self.blk = 0.0           # 最近一次 read() 阻塞耗时(秒), 正常≈1/fps, 卡死时≈stimeout(5s)
+        self.blk_max = 0.0       # 窗口内最大阻塞耗时
         threading.Thread(target=self._loop, daemon=True).start()
     def set_cap(self, cap):
         with self.lock:
@@ -380,10 +434,15 @@ class FrameReader:
             if self._cur is None:
                 time.sleep(0.03)
                 continue
+            _t0 = time.time()
             try:
                 ret, f = self._cur.read()
             except Exception:
                 ret, f = False, None
+            _dt = time.time() - _t0
+            self.blk = _dt
+            if _dt > self.blk_max:
+                self.blk_max = _dt
             if ret and f is not None and f.size > 0:
                 with self.lock:
                     self.frame = f
@@ -393,6 +452,13 @@ class FrameReader:
                 with self.lock:
                     self.fail += 1
                 time.sleep(0.02)
+            # 每秒刷一次吞吐(观测): 健康≈25 帧/s; 卡住时跌到 0
+            _now = time.time()
+            self._win_n += 1
+            if _now - self._win_t >= 1.0:
+                self.rate = self._win_n / (_now - self._win_t)
+                self._win_n = 0
+                self._win_t = _now
     def latest(self, wait=2.0):
         """取最新帧, 至多阻塞 wait 秒等首帧。返回 (frame_copy|None, age秒, 连续失败数)。"""
         t0 = time.time()
@@ -459,6 +525,135 @@ def source_up(rtsp, timeout=2.0):
         return False
     finally:
         s.close()
+
+
+# ===== 观测(A方案): Recv-Q 积压 = 已收到但应用没读走的字节 =====
+# 判据意义: 源死了 -> 积压不涨且帧速为0; 流活着但读线程被卡 -> 积压持续增长且帧速为0.
+# 后者正是当前故障形态, 以前无法与前者区分, 只能靠"帧龄"猜, 于是误判成坏流去 release(杀源)。
+def _tcp_recvq(host, port):
+    """读本机到 host:port 的 ESTABLISHED 连接 Recv-Q 之和(字节)。非 root 也可读。
+    返回 (recvq字节, 连接数); 读不到返回 (-1, 0)。"""
+    ip = socket.gethostbyname(host) if host else None
+    if not ip:
+        return -1, 0
+    def _hex4(a):
+        return "%08X" % (int.from_bytes(socket.inet_aton(a), "little"))
+    want_local = _hex4(ip)
+    want_port = "%04X" % port
+    total = 0; n = 0
+    try:
+        with open("/proc/net/tcp") as f:
+            next(f, None)
+            for line in f:
+                p = line.split()
+                if len(p) < 5 or p[3] != "01":        # 01 = ESTABLISHED
+                    continue
+                lip, lport = p[1].rsplit(":", 1)
+                rip, rport = p[2].rsplit(":", 1)
+                if rip == want_local and rport == want_port:
+                    total += int(p[4]); n += 1
+    except Exception:
+        return -1, 0
+    return total, n
+
+
+def _conn_local_port(host, port):
+    """本机连到 host:port 的 ESTABLISHED 连接里, 找出属于**本进程**那条的本地端口。
+    用于按连接维度读 Recv-Q(和其他客户端如 ffmpeg 区分开)。取本地端口最大的那条
+    (启发式: 后建立的连接端口号更大), 拿不到返回 None。"""
+    ip = socket.gethostbyname(host) if host else None
+    if not ip:
+        return None
+    def _hex4(a):
+        return "%08X" % (int.from_bytes(socket.inet_aton(a), "little"))
+    want_local = _hex4(ip)
+    want_port = "%04X" % port
+    my_inodes = set()
+    try:
+        for fd in os.listdir("/proc/self/fd"):
+            try:
+                tgt = os.readlink(f"/proc/self/fd/{fd}")
+                if tgt.startswith("socket:["):
+                    my_inodes.add(tgt[8:-1])
+            except OSError:
+                continue
+        with open("/proc/net/tcp") as f:
+            next(f, None)
+            best = None
+            for line in f:
+                p = line.split()
+                if len(p) < 10 or p[3] != "01":
+                    continue
+                lip, lport = p[1].rsplit(":", 1)
+                rip, rport = p[2].rsplit(":", 1)
+                if rip == want_local and rport == want_port and p[9] in my_inodes:
+                    if len(lport) != 4:
+                        continue
+                    lpn = int(lport, 16)
+                    if best is None or lpn > best:
+                        best = lpn
+            return best
+    except Exception:
+        return None
+
+
+# 观测状态: 本进程那条 RTSP 连接的本地端口 + 最近几次 Recv-Q 采样(判积压涨/落)
+_probe_port = None
+_recvq_hist = []          # [(时刻, Recv-Q字节), ...] 最多留 8 个
+def _recvq_reset():
+    global _probe_port
+    _probe_port = None
+    _recvq_hist.clear()
+
+def _parse_line(line):
+    """/proc/net/tcp 一行 -> (local_port, recvq, inode) 或 None。
+    防御: 字段数不足/字段形态异常一律返回 None, 绝不让观测代码抛异常
+    把识别主循环带崩(观测是加法, 必须无副作用)。
+
+    注意 p[4] 是 "tx_queue:rx_queue" 冒号连接的**两个**十六进制数, 不是单个数。
+    只写 int(p[4]) 会在任何非零队列上抛 ValueError, 被外层 except 吞掉后
+    恒返回 0 —— 恰好在"真有积压"时失明, 等于探针白装。故取冒号右侧为 Recv-Q。"""
+    try:
+        p = line.split()
+        if len(p) < 10 or p[3] != "01":        # 01 = ESTABLISHED
+            return None
+        lport_hex = p[1].rsplit(":", 1)[-1]
+        if len(lport_hex) != 4:
+            return None
+        rxq_hex = p[4].rsplit(":", 1)[-1]
+        return int(lport_hex, 16), int(rxq_hex, 16), p[9]
+    except (ValueError, IndexError):
+        return None
+
+def _read_socket_q(local_port):
+    """按本地端口读本进程那条连接的 (Recv-Q, 是否存在)。"""
+    try:
+        with open("/proc/net/tcp") as f:
+            next(f, None)
+            for line in f:
+                r = _parse_line(line)
+                if r and r[0] == local_port:
+                    return r[1], True
+    except Exception:
+        pass
+    return 0, False
+
+def _probe_rtsp(reader, rtsp, rtsp2=None):
+    """定位本进程自己那条 RTSP 连接并记一笔初始 Recv-Q(其余客户端如 ffmpeg 不算进来)。"""
+    global _probe_port
+    _probe_port = _conn_local_port(urlparse(rtsp).hostname, urlparse(rtsp).port or 554)
+
+def _probe_cached(reader):
+    """取本进程连接当前 Recv-Q 并追加到采样历史; 未定位到时退化为"全部到该主机的连接之和"。"""
+    q, n = 0, 0
+    if _probe_port is not None:
+        q, ok = _read_socket_q(_probe_port)
+        n = 1 if ok else 0
+    else:
+        return 0, 0
+    _recvq_hist.append((time.time(), q))
+    del _recvq_hist[:-8]
+    return q, n
 
 def reconnect(rtsp, probe_gap=3, alert_after=5):
     """重连: 先探源端口在监听才建流; 源已退出则每 probe_gap 秒轻量探一次
@@ -574,6 +769,7 @@ def main():
     if not _expl("--confirm"): args.confirm = _prof["confirm"]
     args.frames = args.frames_cli if args.frames_cli is not None else _prof['frames']
     start_stderr_monitor()
+    start_log_timestamp()      # 必须在 stderr 劫持之后: 否则 _stderr_pump 拿到的是被包装过的 fd
 
     signal.signal(signal.SIGINT, _on_signal)
     signal.signal(signal.SIGTERM, _on_signal)
@@ -609,7 +805,7 @@ def main():
         if cap is None:
             print("[退出]"); return
     print(f"  流: {int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))}x{int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))}")
-    reader = FrameReader()          # 后台线程持续排空缓冲, 主循环只取最新帧
+    reader = FrameReader("front")          # 后台线程持续排空缓冲, 主循环只取最新帧
     reader.set_cap(cap)
 
     # v2.1 第二路(背面)只拉流: 复用 FrameReader; 空 --rtsp2 = 双路关(reader2=None, 全程 if reader2 守卫, 单路路径不变)
@@ -618,7 +814,7 @@ def main():
     if args.rtsp2:
         cap2 = open_verified(args.rtsp2)
         if cap2 is not None:
-            reader2 = FrameReader(); reader2.set_cap(cap2)
+            reader2 = FrameReader("back"); reader2.set_cap(cap2)
             print(f"  第二路(背面): {int(cap2.get(cv2.CAP_PROP_FRAME_WIDTH))}x{int(cap2.get(cv2.CAP_PROP_FRAME_HEIGHT))}")
         else:
             print(f"  ⚠ 第二路 {args.rtsp2} 暂不可达, 本次降级为单路(仅正面), 背面抓拍跳过")
@@ -644,22 +840,32 @@ def main():
             frame, age, rfail = reader.latest(wait=2.0)
             if frame is None or age > args.wedge_age:
                 fail += 1
+                # 观测: 积压是否在涨 + 解码速率是否归零, 用于区分"源死了"和"读线程被卡住"
+                if fail == 1:
+                    _probe_rtsp(reader, args.rtsp, args.rtsp2)
+                rq, rqn = _probe_cached(reader)
+                grow = ""
+                if len(_recvq_hist) >= 2:
+                    d = _recvq_hist[0][1] - _recvq_hist[-1][1]
+                    grow = f" 积压{'↑' if d > 0 else '↓'}{abs(d)//1024}KB/{_recvq_hist[0][0]-_recvq_hist[-1][0]:.0f}s"
+                diag = (f"帧速{reader.rate:.1f}f/s blk={reader.blk:.2f}s(max{reader.blk_max:.1f})"
+                        f" Recv-Q={rq//1024}KB({rqn}条){grow}")
                 # 根因C: ref-error(丢参考帧)正刷=解码器等下个IDR关键帧自愈, 瞬时坏流。
                 # 绝不重连(重连从GOP中间重进->又一片ref-error->churn自激)。保持同连接等IDR。
                 active_errs = decode_err_rate(2.0)
                 if active_errs > 0 and age < args.wedge_dead_s:
                     if fail == 1:
-                        print(f"  无新鲜帧(帧龄{age:.1f}s/解码错{active_errs}条/2s), 等IDR自愈(不重连)...")
+                        print(f"  无新鲜帧(帧龄{age:.1f}s/解码错{active_errs}条/2s) {diag}, 等IDR自愈(不重连)...")
                     time.sleep(0.3)
                     continue
                 # 无解码活动的短暂无帧: 给瞬时抖动一点自愈时间
                 if fail < args.wedge_fails and age < args.wedge_dead_s:
                     if fail == 1:
-                        print(f"  无新鲜帧(帧龄{age:.1f}s/线程失败{rfail}), 快速等待自愈...")
+                        print(f"  无新鲜帧(帧龄{age:.1f}s/线程失败{rfail}) {diag}, 快速等待自愈...")
                     time.sleep(0.3)
                     continue
                 # 真坏流: 无解码活动持续无帧, 或超死线仍无帧 -> release+重连(reconnect内探端口)
-                print(f"  ⚠ 坏流确认(帧龄{age:.1f}s/失败{fail}/解码错{active_errs}), 释放并重连...")
+                print(f"  ⚠ 坏流确认(帧龄{age:.1f}s/失败{fail}/解码错{active_errs}) {diag}, 释放并重连...")
                 reader.set_cap(None)
                 reader.wait_released(6.0)
                 cap = reconnect(args.rtsp)
@@ -667,9 +873,16 @@ def main():
                     break
                 reader.set_cap(cap)
                 fail = 0
+                _recvq_reset()
+                _probe_rtsp(reader, args.rtsp, args.rtsp2)
                 continue
             fail = 0
             mon += 1
+            # 周期状态行(观测): 每 100 次监控记一行健康快照, 有病时能看出是从哪一刻开始退化的
+            if mon % 100 == 0:
+                rq, rqn = _probe_cached(reader)
+                print(f"  [状态{mon}] 帧速{reader.rate:.1f}f/s blk={reader.blk:.2f}s(max{reader.blk_max:.1f}) "
+                      f"帧龄{age:.2f}s Recv-Q={rq//1024}KB({rqn}条) 解码错{decode_err_rate(2.0)}条/2s")
             # 模型闲时释放: 距上次识别超阈且当前加载着 -> 释放省NPU(下块板懒加载)
             if args.ocr_idle_unload > 0 and eng.d is not None and time.time()-last_event > args.ocr_idle_unload:
                 eng.unload()
