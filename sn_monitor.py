@@ -678,7 +678,7 @@ def reconnect(rtsp, probe_gap=3, alert_after=5):
         time.sleep(probe_gap)
     return None
 
-def reconnect_bounded(rtsp, max_tries=3, probe_gap=5, verify_wait=0.0):
+def reconnect_bounded(rtsp, max_tries=3, probe_gap=5, verify_wait=0.0, max_secs=0.0):
     """有界重连: 最多试 max_tries 轮(每轮先探活, 通了才开流), 用尽返回 None。
 
     为什么必须有界: 运行期绝不能让一个源拖死整个主循环 —— 现场故障里
@@ -687,10 +687,16 @@ def reconnect_bounded(rtsp, max_tries=3, probe_gap=5, verify_wait=0.0):
     也不能整机停摆。返回 None 由调用方转入低频后台重探。
 
     verify_wait: 每轮之间的额外等待; 后台重探传 0 以免拖慢主循环。
+    max_secs:    墙钟上限(>0 时生效)。**必须用墙钟而非轮数兜底** ——
+                 open_verified() 内部自带最长 30s 阻塞, 轮数相同耗时可能差
+                 好几倍(实测 3 轮曾跑到 90s), 只有秒数能给出真实上界。
     """
-    for _ in range(max_tries):
+    t_start = time.monotonic()
+    for i in range(max_tries):
         if STOP:
             return None
+        if max_secs > 0 and i > 0 and time.monotonic() - t_start >= max_secs:
+            break
         if source_up(rtsp):
             cap = open_verified(rtsp)        # 校验活流(挡 0x0 半死流)
             if cap is not None:
@@ -822,6 +828,15 @@ def main():
     # ★ 韧性三件套(P1/P2/P5): 防"一个源拖死主循环"、防"静置期失明"
     p.add_argument("--start-reconnect-tries", type=int, default=3, dest="start_reconnect_tries",
           help="启动期正面源不可达时的有界重连轮数, 用尽则退出交 systemd 重试(默认3)")
+    p.add_argument("--start-reconnect-secs", type=float, default=120.0, dest="start_reconnect_secs",
+          help="启动期有界重连的墙钟上限(秒)。open_verified 每次自身可阻塞30s, 只靠轮数"
+               "给不出真实上界(实测3轮≈90s)。默认120交棒 systemd 重启")
+    p.add_argument("--start-reconnect-gap", type=float, default=5.0, dest="start_reconnect_gap",
+          help="启动期重连轮间隔(秒)。启动期要快探(相机刚上电到出流通常几秒), "
+               "与运行期的 --back-reprobe-interval(30s) 意图不同, 故分开(默认5)")
+    p.add_argument("--runtime-reconnect-secs", type=float, default=45.0, dest="runtime_reconnect_secs",
+          help="运行期单次有界重连的墙钟上限(秒)。必须明显小于 --loop-watchdog, "
+               "否则重连本身就够长到被看门狗误报(默认45)")
     p.add_argument("--back-reconnect-tries", type=int, default=3, dest="back_reconnect_tries",
           help="运行期(正面/背面)单次有界重连轮数, 用尽后回主循环下轮再试(默认3)")
     p.add_argument("--back-reprobe-interval", type=float, default=30.0, dest="back_reprobe_interval",
@@ -961,7 +976,8 @@ def main():
     if cap is None:
         print("首次打开失败/坏流, 有界重连等待源...")
         cap = reconnect_bounded(args.rtsp, max_tries=args.start_reconnect_tries,
-                                probe_gap=args.back_reprobe_interval)
+                                probe_gap=args.start_reconnect_gap,
+                                max_secs=args.start_reconnect_secs)
     if cap is None:
         print("[退出] 正面源不可达且重连用尽 —— 由 systemd 按 Restart=always 重试"
               "(预览端口已在监听, 可从前端看到离线状态)")
@@ -1028,7 +1044,8 @@ def main():
                 reader.set_cap(None)
                 reader.wait_released(6.0)
                 cap = reconnect_bounded(args.rtsp, max_tries=args.back_reconnect_tries,
-                                        probe_gap=args.back_reprobe_interval)
+                                        probe_gap=args.back_reprobe_interval,
+                                        max_secs=args.runtime_reconnect_secs)
                 if cap is None:
                     # 正面暂不可用: 不清空 reader, 留在原地由下一轮继续尝试有界重连。
                     # 旧行为这里 break 直接退出进程, 服务靠 systemd 拉起 —— 但那样
