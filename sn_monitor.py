@@ -763,7 +763,8 @@ back_health_tick.last = 0.0
 back_health_tick.fails = 0
 
 
-def probe_and_recover(reader, rtsp, min_interval=30.0, wedge_fails=3, wedge_age=3.0):
+def probe_and_recover(reader, rtsp, min_interval=30.0, wedge_fails=3, wedge_age=3.0,
+                      fails=0, max_secs=45.0):
     """背面恢复: 低频、有界、非阻塞。
 
     先纯 TCP 探活(source_up, ~0s), 源真回来了才付"开流"的代价。
@@ -774,12 +775,29 @@ def probe_and_recover(reader, rtsp, min_interval=30.0, wedge_fails=3, wedge_age=
       否则这个函数每 30s 都会再开一条新流盖掉正在正常工作的那条 ——
       对"单客户端"相机源尤其危险(见 rtsp-camera-udp-teardown: 旧连接没
       TEARDOWN 干净, 新连接拉不起来)。恢复动作只在真离线时才允许发生。
+
+    ★ 为什么背面必须和正面用同一套判据(现场: 正面子码流基本不挂死, 背面经常挂死):
+      原先背面从"帧陈旧"直接跳到重连, 缺了正面已有的三层保护, 反把单客户端源
+      往脏断开方向推 —— 这解释了同一台相机上两种客户端的不对称。
     """
     # 已经能持续拿到新鲜帧 -> 无需恢复, 也不该打断
     age = reader.last_age()
     if age is not None and age <= wedge_age:
         probe_and_recover.offline = False
         return False
+
+    # ★ 门1: 失败计数门。告警门是连续 wedge_fails 次异常, 动作门原先却是**单次**
+    #   last_age() 采样 —— 一次 3s 抖动就重连一次, 背面长期在重连 churn 里打转。
+    #   只计数不动流, 等 back_health_tick 攒够次数。
+    if fails < wedge_fails:
+        return probe_and_recover.offline
+
+    # ★ 门2: IDR 自愈判据(对齐正面)。解码错误正刷 = 解码器等下个 IDR 关键帧
+    #   自愈, 是瞬时坏流。此时**绝不重连**: 重连从 GOP 中间重进, 又吃到一片
+    #   ref-error -> churn 自激, 越治越坏。保持同连接等 IDR 即可。
+    if decode_err_rate(2.0) > 0:
+        print("  · 背面解码错在刷(ref-error), 等 IDR 自愈(不重连)...")
+        return probe_and_recover.offline
 
     now = time.time()
     if now - probe_and_recover.last < min_interval:     # 节流: 低频重探
@@ -793,7 +811,13 @@ def probe_and_recover(reader, rtsp, min_interval=30.0, wedge_fails=3, wedge_age=
         probe_and_recover.offline = True
         return True
 
-    cap = reconnect_bounded(rtsp, max_tries=1, probe_gap=0)
+    # ★ 门3: 先释放、后开流(对齐正面)。单客户端源上, 旧连接没断干净就建新连接,
+    #   会出现两条 RTSP 会话并存的窗口 —— 正是 rtsp-camera-udp-teardown 里
+    #   "脏断开后再也拉不起来"的成因。必须先让 reader 线程放开旧 cap 再开新的。
+    reader.set_cap(None)
+    reader.wait_released(6.0)
+
+    cap = reconnect_bounded(rtsp, max_tries=1, probe_gap=0, max_secs=max_secs)
     if cap is None:
         print(f"  · 背面源端口在监听但开流失败(可能仍无码流), 下轮再试")
         probe_and_recover.offline = True
@@ -1112,15 +1136,22 @@ def main():
                     _la = reader2.last_age()
                     _desc = "从未出帧" if _la is None else f"帧龄{_la:.1f}s"
                     print(f"  ⚠ 背面链路异常({_desc}/连续{back_health_tick.fails}次), 转入低频重探...")
-                    back_health_tick.fails = 0
                 # ★ 每次主循环都调, 由函数内部按 min_interval 节流 —— 它自己负责
                 #   "探活->开流->set_cap", 健康检查只负责报"该重探了", 不在这里多手 set_cap,
                 #   否则刚接上的流会被下一轮再次清掉, 永远接不上。
+                # ★ 把当前的连续异常次数传进去: 动作门必须与告警门同源, 否则一次
+                #   瞬时抖动就会动流(见 probe_and_recover 门1)。
                 back_offline = probe_and_recover(
                     reader2, args.rtsp2,
                     min_interval=args.back_reprobe_interval,
                     wedge_fails=args.wedge_fails,
-                    wedge_age=args.wedge_age)
+                    wedge_age=args.wedge_age,
+                    fails=back_health_tick.fails,
+                    max_secs=args.runtime_reconnect_secs)
+                # 已达门且真动了流(或确认离线)才清零计数, 让下一轮从 0 重新攒。
+                if need and back_health_tick.fails >= args.wedge_fails and (
+                        back_offline or probe_and_recover.last > 0):
+                    back_health_tick.fails = 0
             # 背面离线心跳: 每 30s 一条, 保证"静置期也能从日志看出链路状态"
             if reader2 is not None and mon % 30 == 0:
                 _la = reader2.last_age()
