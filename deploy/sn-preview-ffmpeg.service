@@ -8,16 +8,14 @@ Type=simple
 User=root
 # 正面子码流(.9) + 背面子码流(.8) 同时在板内推流
 # h264_bm only works with BM1688 HW decoder output (no pipe:0)
-ExecStart=/bin/bash -c 'set -m; \
-  /opt/sophon/sophon-ffmpeg_2.2.0/bin/ffmpeg \
-    -rtsp_transport tcp -i rtsp://192.168.1.9:8554/live1 \
-    -an -c:v h264_bm -b:v 2M -g 30 -bf 0 \
-    -f flv rtmp://10.80.40.57:1935/cam_front & \
-  /opt/sophon/sophon-ffmpeg_2.2.0/bin/ffmpeg \
-    -rtsp_transport tcp -i rtsp://192.168.1.8:8554/live1 \
-    -an -c:v h264_bm -b:v 2M -g 30 -bf 0 \
-    -f flv rtmp://10.80.40.57:1935/cam_back & \
-  wait'
+#
+# ★ 为什么不再内联 `set -m; ffmpeg A & ffmpeg B & wait`:
+#   那样写任一路 ffmpeg 退出后, `wait` 只等**剩下的**那个, 不会重拉已退出的那路;
+#   而 systemd 看到 bash 外壳还活着, 就认为单元健康 -> 永久单路(现场"背面没视频"
+#   而单元 state=active/NRestarts 不增, 正是此因)。
+#   ffmpeg 遇流抖动是**直接退出**, python reader 是**重试** —— 这解释了同一台相机
+#   上两种客户端的不对称。改由监督脚本各自记账、谁退重拉谁。
+ExecStart=/bin/bash /data/soph_SN/deploy/preview_supervisor.sh
 Restart=always
 RestartSec=10
 KillSignal=SIGINT

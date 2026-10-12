@@ -65,6 +65,10 @@ RESOLUTIONS = {
 # MJPEG 分隔符。前端 camera.ts / camera.py 按这个名字解析，改名要同步改。
 BOUNDARY = "snframe"
 
+# /status 判"源是否在线"的源帧龄上限(秒)。取 15s: 远大于正常出帧间隔(≤1s),
+# 又不至于把"刚断流的相机还报绿"漏过去。只在 status() 里用于外显, 不影响识别。
+STALE_S = 15.0
+
 _PREVIEW_HEADERS = {
     "Cache-Control": "no-store, no-cache, must-revalidate",
     "Pragma": "no-cache",
@@ -153,12 +157,23 @@ class PreviewEncoder:
     def status(self):
         with self._lock:
             age = (time.time() - self._ts) if self._ts else None
+            # ★ 源帧龄必须取自 reader, 不是编码时刻 self._ts。
+            #   现场故障: .8 已死 11 小时, 但 self._ts 反映的是预览**编码**时刻,
+            #   而监控进程仍在"对着老帧转"-> /status 一路报 source_ok=True。
+            #   假绿比没指示更危险(连着两晚"看着是好的")。这里以源为准。
+            rd = self.reader
+            try:
+                src_age = rd.last_age() if rd is not None else None
+            except Exception:                       # noqa: BLE001
+                src_age = None
+            # None = 从未出过帧; 超出 STALE_S 未更新 = 源已死/断流。
+            source_ok = src_age is not None and src_age <= STALE_S
             return {
                 "name": self.name,
                 "resolution": self._res,
                 "size": RESOLUTIONS.get(self._res, (0, 0)),
-                # reader.frame is None 表示这一路还没解出任何帧（相机没起来/断流）
-                "source_ok": getattr(self.reader, "frame", None) is not None,
+                "source_ok": source_ok,
+                "source_age": (None if src_age is None else round(src_age, 3)),
                 "frames": self._enc_n,
                 "seq": self._seq,
                 "age": age,
