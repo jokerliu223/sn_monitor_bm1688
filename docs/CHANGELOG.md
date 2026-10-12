@@ -60,6 +60,8 @@ SN 抓拍显示挂死前最后一帧。`reader2` 只有启动时的 `open_verifi
 - `deploy/mediamtx.service`：MediaMTX systemd 单元（Go 单文件, ~6MB RAM）
 - `deploy/sn-preview-ffmpeg.service`：ffmpeg 推流 systemd 单元
 
+> ⚠️ **后续更正（现状）**：V4.0 初版把 MediaMTX 放在**板子**上（`deploy/mediamtx.service`）。后来 MediaMTX 移到 **`.57` 服务器**（与浏览器同源网络，ICE 不跨网段），`deploy/mediamtx.service` 已删除（commit `ade7bce`）。现在 MediaMTX 由 `.57` 的 `product_test/start.sh` 拉起，板子侧只保留 `sn-preview-ffmpeg.service` 推流。部署以 [deployment-mediamtx.md](deployment-mediamtx.md) 为准，下面这段 `enable mediamtx` 仅为历史记录。
+
 **部署**（一次性）：
 ```bash
 # 安装 MediaMTX ARM64 二进制 + systemd 单元 → enable
