@@ -62,7 +62,7 @@ JPEG_QUALITY = int(os.environ.get("PREVIEW_JPEG_QUALITY", "80"))  # 注：Bmcv �
 SRC_FPS_CAP = float(os.environ.get("PREVIEW_SRC_FPS", "20"))
 # 断流重连的探端口间隔，避免对着已经死掉的端口猛刷 ffmpeg（沿用识别脚本的做法）
 RECONNECT_PROBE_GAP = float(os.environ.get("PREVIEW_PROBE_GAP", "3"))
-LISTEN_PORT = int(os.environ.get("PREVIEW_PORT", "8090"))
+LISTEN_PORT = int(os.environ.get("PREVIEW_PORT", "8091"))
 BOUNDARY = "snframe"
 
 

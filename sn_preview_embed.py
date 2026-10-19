@@ -323,7 +323,7 @@ def find_latest_capture(results_dir):
 # ---------------------------------------------------------------------------
 # Flask 应用
 # ---------------------------------------------------------------------------
-def build_app(encoders, stop_flag=None, preview_port=8090, fps_cap=0.0):
+def build_app(encoders, stop_flag=None, preview_port=8091, fps_cap=0.0):
     """encoders: {"front": PreviewEncoder, "back": PreviewEncoder}
 
     所有路由内部全部 try/except：Flask 线程崩溃在 V3.0 里会带走识别进程，
@@ -464,7 +464,7 @@ def build_app(encoders, stop_flag=None, preview_port=8090, fps_cap=0.0):
     return app
 
 
-def attach(reader, reader2, results_dir, port=8090, fps=8.0,
+def attach(reader, reader2, results_dir, port=8091, fps=8.0,
            res="4k", preview=(True, True), jpeg_quality=80):
     """在 sn_monitor 里调用这一行即可挂上预览。
 
