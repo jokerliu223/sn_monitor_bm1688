@@ -49,7 +49,7 @@ log() { echo "[supervisor] $(date '+%H:%M:%S') $*"; }
 #   直接 `cmd &` 时 $! 就是 ffmpeg 本身，TERM 与 wait 都作用在正确对象上。
 start_front() {
   "$FFMPEG" -rtsp_transport tcp -i "${URL[front]}" \
-    -an -c:v h264_bm -b:v 2M -g 30 -bf 0 \
+    -an -c:v h264_bm -b:v 2M -g 30 -bf 0 -flvflags no_duration_filesize \
     -f flv "${RTMP[front]}" &
   PID[front]=$!
   STARTED[front]=$(date +%s)
@@ -58,7 +58,7 @@ start_front() {
 }
 start_back() {
   "$FFMPEG" -rtsp_transport tcp -i "${URL[back]}" \
-    -an -c:v h264_bm -b:v 2M -g 30 -bf 0 \
+    -an -c:v h264_bm -b:v 2M -g 30 -bf 0 -flvflags no_duration_filesize \
     -f flv "${RTMP[back]}" &
   PID[back]=$!
   STARTED[back]=$(date +%s)
@@ -66,13 +66,14 @@ start_back() {
   log "back 已拉起 (pid=${PID[back]}) <- ${URL[back]}"
 }
 
-# 退避档位: 3,6,12,24,30,30... 上限 30s(源长时间不可用时别暴力刷 ffmpeg)
+# 退避档位: 5,10,20,30,30... 上限 30s(源长时间不可用时别暴力刷 ffmpeg)
+# V4.1: 起步从 3s 提到 5s —— 非零退出时 ffmpeg 的 RTSP 释放可能不干净,
+# 对单客户端源(.8)脏断开即卡死不自愈，多给 2s 让 TCP 超时释放残留半连接。
 backoff_secs() {
   case "$1" in
-    0) echo 3  ;;
-    1) echo 6  ;;
-    2) echo 12 ;;
-    3) echo 24 ;;
+    0) echo 5  ;;
+    1) echo 10 ;;
+    2) echo 20 ;;
     *) echo 30 ;;
   esac
 }
@@ -147,6 +148,10 @@ while [ "$RUNNING" = "1" ]; do
     delay=$(backoff_secs "$b")
     PID[$name]=""
     BOFF[$name]=$(( b + 1 ))
+    # V4.1: ffmpeg非零退出→额外冷却3s，释放残留RTSP半连接
+    if [ "$rc" -ne 0 ]; then
+      delay=$(( delay + 3 ))
+    fi
     NEXT[$name]=$(( now + delay ))
     log "⚠ $name 退出 (rc=$rc), ${delay}s 后重拉 (连续第 ${BOFF[$name]} 次)"
   done
