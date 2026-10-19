@@ -72,7 +72,7 @@ if [ ! -f "sn_monitor.py" ]; then
 fi
 
 # 检查互联网
-ping -c1 -W2 114.114.114.114 >/dev/null 2>&1 || { echo -e "  ${YELLOW}⚠ 无互联网，跳过下载步骤${NC}"; }
+ping -c1 -W2 github.com >/dev/null 2>&1 && HAS_NET=1 || { echo -e "  ${YELLOW}⚠ 无互联网，跳过下载步骤${NC}"; HAS_NET=0; }
 
 # opencv-python-headless
 pip3 show opencv-python-headless >/dev/null 2>&1 && echo "  opencv-python-headless: 已安装" || {
