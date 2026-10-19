@@ -7,6 +7,23 @@ SE9 / BM1688 算能板用 eth1 接一台路由器/交换机组成小局域网，
 
 ---
 
+## 快速部署（新板首次装机）
+
+```bash
+# ① 拉代码（只需一行）
+git clone https://github.com/jokerliu223/sn_monitor_bm1688.git /data/soph_SN/
+
+# ② 一键部署（模型+依赖+配置+unit+启动）
+cd /data/soph_SN && sudo ./deploy/init.sh
+```
+
+`init.sh` 会引导你确认：摄像头 IP、webserver IP、预览端口、板型——其余全自动。
+> 仓库为 public，HTTPS clone 免认证。板上需先联网（`eth0`）。
+
+以后更新：`cd /data/soph_SN && git pull && sudo systemctl restart sn-monitor-big`
+
+---
+
 ## 1. 它做什么
 
 摄像头对着流水线上的板卡，人放一块板 → 程序自动：
@@ -91,23 +108,22 @@ ssh linaro@<板子IP> 'cat  /data/soph_SN/sn_results/sn_list.txt'
 > ⚠️ **铁律 1（摄像头）**：重启/停止服务会断开 → **杀死单客户端源**。重启服务必须**同时重启摄像头推流**，双路时两台都要重启。
 > ⚠️ **铁律 2（摆放）**：**SN 贴纸面必须朝相机、摆画面右上区**（小板像好帧 cx≈0.62 / cy≈0.30）。摆错 → 整幅无 SN → 必漏识。
 
-### 3.3 代码部署（板上没有 git 仓库，走 scp）
+### 3.3 代码部署（git clone，板上直接拉）
 
-> ⚠️ 板上 `/data/soph_SN/` 是扁平手工部署目录，**不能 `git pull`**，更新一律用 scp。
+> 仓库为 public，HTTPS 免认证。
 
 ```bash
-# 在工作站仓库根目录执行
-scp sn_monitor.py sn_preview_embed.py sn_uploader.py linaro@<板子IP>:/data/soph_SN/
-scp -r sncore linaro@<板子IP>:/data/soph_SN/
-
-# 语法自检（板上没有 tools/，sn_uploader.py 在根目录）
-ssh linaro@<板子IP> 'cd /data/soph_SN && python3 -m py_compile sn_monitor.py sn_preview_embed.py sn_uploader.py sncore/*.py && echo OK'
-
-# 生效（★ 记得同时重启摄像头推流，铁律 1）
-ssh linaro@<板子IP> 'echo linaro | sudo -S systemctl restart sn-monitor-big'
+git clone https://github.com/jokerliu223/sn_monitor_bm1688.git /data/soph_SN/
 ```
 
-> 只改 `.py` 不用动 systemd 单元；只有 `deploy/*.service` 变了才按 3.4 重装。
+以后更新：
+```bash
+cd /data/soph_SN && git pull
+# 仅 .py 更新：sudo systemctl restart sn-monitor-big
+# 如果 deploy/*.service 也变了：先 sudo cp deploy/*.service /etc/systemd/system/ && sudo systemctl daemon-reload
+```
+
+> 以后更新：`cd /data/soph_SN && git pull && sudo systemctl restart sn-monitor-big`
 
 ### 3.4 systemd 单元装到 `/etc/`（唯一权威说明）
 
