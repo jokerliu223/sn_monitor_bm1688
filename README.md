@@ -37,9 +37,8 @@ cd /data/soph_SN && sudo ./deploy/init.sh
 四种形态：
 
 - **单路识别（默认）**：eth1 挂一台相机对正面，识别 SN。
-- **双路（V2.1，加 `--rtsp2`）**：再挂第二台对背面，正面命中时同步抓一帧背面图，正/反一并上传、在产测网页成对展示。两路各拉各的流、不合并。
-- **调机预览（★ V4.0 WebRTC）**：板子 ffmpeg 独立拉**子码流** `live1` → BM1688 硬件 H264 编码 → RTMP 推到 `.57` → `.57` 的 MediaMTX 转 WebRTC → 前端实时播放，延迟 <500ms。不占识别主码流。部署见 [docs/deployment-mediamtx.md](docs/deployment-mediamtx.md)。
-- **调机预览（V3.0 MJPEG，已废弃）**：识别进程内嵌 JPEG → MJPEG 中继，V4.0 已替换。
+- **双路（加 `--rtsp2`）**：再挂第二台对背面，正面命中时同步抓一帧背面图，正/反一并上传、在产测网页成对展示。两路各拉各的流、不合并。
+- **调机预览（WebRTC）**：板子 ffmpeg 独立拉**子码流** `live1` → BM1688 硬件 H264 编码 → RTMP 推到 `.57` → `.57` 的 MediaMTX 转 WebRTC → 前端实时播放，延迟 <500ms。不占识别主码流。部署见 [docs/deployment-mediamtx.md](docs/deployment-mediamtx.md)。
 
 ---
 
