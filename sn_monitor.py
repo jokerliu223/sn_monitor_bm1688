@@ -949,7 +949,7 @@ def main():
     # V3.0 调机预览(可选, 全带默认值 -> 不给也照常跑纯识别)
     p.add_argument("--no-preview", action="store_false", dest="preview",
                    help="关闭内嵌预览(退回 V2 纯识别行为; 预览出问题时的干净回退开关)")
-    p.add_argument("--preview-port", type=int, default=8090, dest="preview_port")
+    p.add_argument("--preview-port", type=int, default=8091, dest="preview_port")
     p.add_argument("--preview-fps", type=float, default=8.0, dest="preview_fps",
                    help="预览编码上限帧率(节流阈值, 不追满解码帧率; 8 远低于实测上限, 给识别留足余量)")
     p.add_argument("--preview-res", choices=["4k", "1080p", "720p", "360p"], default="4k",
